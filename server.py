@@ -27,7 +27,7 @@ from pathlib import Path
 from engine import BackupEngine, BackupError, Config, Mailer, State
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
-VERSION = "2.0.0"
+VERSION = "2.0.2"
 
 SESSION_TTL = 24 * 3600
 

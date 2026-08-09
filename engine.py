@@ -235,7 +235,7 @@ class BackupEngine:
     def __init__(self, config, state, backup_dir=None):
         self.config = config
         self.state = state
-        self.backup_dir = Path(config.get().get("backup_dir") or backup_dir or "/backups")
+        self.backup_dir = Path(backup_dir or config.get().get("backup_dir") or "/backups")
 
     # --- transport ---
     def _opener(self):

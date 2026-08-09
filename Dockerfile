@@ -5,7 +5,7 @@ WORKDIR /opt/backup
 COPY engine.py server.py ./
 COPY static/ static/
 
-RUN adduser -D -u 65534 backup
+RUN adduser -D -u 10001 -g '' backup
 
 USER 65534
 

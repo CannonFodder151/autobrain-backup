@@ -28,6 +28,7 @@ input:focus{border-color:var(--accent);outline:none}
 button{cursor:pointer;border:none;border-radius:6px;padding:9px 14px;font:inherit;font-weight:600}
 .btn{background:var(--accent);color:#fff}.btn:hover{filter:brightness(1.1)}
 .btn-green{background:var(--green);color:#06210f}.btn-red{background:var(--red);color:#fff}
+.btn-sm{padding:4px 10px;font-size:12px;border-radius:6px}
 button:disabled{opacity:.5;cursor:not-allowed}
 table{width:100%;border-collapse:collapse;font-size:13px}
 th,td{text-align:left;padding:7px 8px;border-bottom:1px solid var(--border)}
@@ -41,6 +42,12 @@ a{color:var(--accent)}
 .modal .box{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:20px;max-width:480px;width:90%}
 .gate{position:fixed;inset:0;background:var(--bg);display:flex;align-items:center;justify-content:center;z-index:20}
 .gate .box{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:24px;width:min(360px,90%)}
+.inst{border:1px solid var(--border);border-radius:8px;padding:10px 12px;display:flex;align-items:center;gap:12px;margin-bottom:8px;background:var(--bg)}
+.inst.sel{border-color:var(--accent)}
+.inst .nm{flex:1;min-width:0}
+.inst .nm b{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.inst .nm small{color:var(--muted)}
+.empty{color:var(--muted);text-align:center;padding:16px}
 small{color:var(--muted)}
 </style>
 </head>
@@ -59,47 +66,55 @@ small{color:var(--muted)}
   <h1>AutoBrain Backup</h1>
   <span class="tag">web console · <span id="version">…</span></span>
   <span style="flex:1"></span>
-  <button class="btn" id="runNow">Run backup now</button>
+  <button class="btn" id="testEmail">Test email</button>
+  <button class="btn" id="addInst">+ Add instance</button>
+  <button class="btn btn-green" id="runNow">Run backup now</button>
 </header>
 <main id="app">
-  <div class="card" id="healthCard">
+  <div class="card">
+    <h2>Instances</h2>
+    <div id="instList"></div>
+    <div class="msg" id="instMsg"></div>
+  </div>
+  <div class="card" id="healthCard" style="display:none">
     <h2>Health &amp; stats</h2>
     <div class="grid" id="health"></div>
   </div>
-  <div class="card">
+  <div class="card" id="cfgCard" style="display:none">
     <h2>Configuration</h2>
     <div class="row">
+      <div><label>Nickname (optional)</label><input id="cfg_nick"></div>
       <div><label>AutoBrain instance URL</label><input id="cfg_url" placeholder="https://app.autobrainservice.app"></div>
-      <div><label>Admin API key (X-Admin-API-Key)</label><input id="cfg_key" type="password" placeholder="admin API key"></div>
     </div>
     <div class="row">
-      <div><label>Backup endpoint</label><input id="cfg_bk" value="/admin-api/backup"></div>
-      <div><label>Restore endpoint</label><input id="cfg_rst" value="/admin-api/restore"></div>
+      <div><label>Admin API key (X-Admin-API-Key)</label><input id="cfg_key" type="password" placeholder="admin API key"></div>
+      <div><label>Ingest key (optional, for autobrain-backup-agent push)</label><input id="cfg_ingest" type="password"></div>
+    </div>
+    <div class="row">
+      <div><label>Backup endpoint</label><input id="cfg_bk" value="/api/v1/admin-api/backup"></div>
+      <div><label>Restore endpoint</label><input id="cfg_rst" value="/api/v1/admin-api/restore"></div>
     </div>
     <div class="row">
       <div><label>Schedule interval (seconds)</label><input id="cfg_int" type="number" min="60" value="3600"></div>
-      <div><label>Ingest key (optional, for autobrain-backup-agent push)</label><input id="cfg_ingest" type="password"></div>
+      <div><label><input type="checkbox" id="cfg_enabled" checked> Instance enabled (scheduled backups)</label></div>
     </div>
     <div class="row3">
       <div><label>Retain hourly</label><input id="cfg_hourly" type="number" min="0" value="24"></div>
       <div><label>Retain daily</label><input id="cfg_daily" type="number" min="0" value="30"></div>
       <div><label>Retain weekly</label><input id="cfg_weekly" type="number" min="0" value="12"></div>
     </div>
+    <h2 style="margin-top:18px">Email alerts (shared SMTP)</h2>
     <div class="row">
-      <div><label>Login username (empty = open console)</label><input id="cfg_gui_user"></div>
-      <div><label>Login password</label><input id="cfg_gui_pass" type="password"></div>
-    </div>
-    <div class="row">
-      <div><label>Legacy GUI key (API clients, optional)</label><input id="cfg_gui" type="password"></div>
       <div><label>SMTP host</label><input id="cfg_smtp_host"></div>
+      <div><label>SMTP port</label><input id="cfg_smtp_port" type="number" value="587"></div>
     </div>
     <div class="row">
       <div><label>SMTP user</label><input id="cfg_smtp_user"></div>
       <div><label>SMTP password</label><input id="cfg_smtp_pass" type="password"></div>
     </div>
     <div class="row">
-      <div><label>SMTP port</label><input id="cfg_smtp_port" type="number" value="587"></div>
-      <div><label>Sender / recipients (comma-separated)</label><input id="cfg_smtp_to" placeholder="alerts@example.com, admin@example.com"></div>
+      <div><label>From address (e.g. no-reply@autobrainservice.app)</label><input id="cfg_smtp_from" placeholder="alerts@example.com"></div>
+      <div><label>Recipients (comma-separated)</label><input id="cfg_smtp_to" placeholder="alerts@example.com, admin@example.com"></div>
     </div>
     <div class="row">
       <div><label><input type="checkbox" id="cfg_email_on"> Email alerts on failure / corruption</label></div>
@@ -108,11 +123,11 @@ small{color:var(--muted)}
     <div class="actions">
       <button class="btn-green" id="saveCfg">Save configuration</button>
       <span style="flex:1"></span>
-      <button class="btn" id="newBackupFolder">Reset backup folder</button>
+      <button class="btn-red" id="delInst">Delete this instance</button>
     </div>
     <div class="msg" id="cfgMsg"></div>
   </div>
-  <div class="card">
+  <div class="card" id="bkCard" style="display:none">
     <h2>Backups &amp; restore</h2>
     <div id="tabs"></div>
     <div class="actions">
@@ -122,6 +137,19 @@ small{color:var(--muted)}
     <div class="msg" id="restoreMsg"></div>
   </div>
 </main>
+<div class="modal" id="instModal">
+  <div class="box">
+    <h2 id="instModalTitle">Add instance</h2>
+    <label>Nickname</label><input id="im_nick" placeholder="e.g. Hosted production">
+    <label>Instance URL</label><input id="im_url" placeholder="https://app.autobrainservice.app">
+    <label>Admin API key</label><input id="im_key" type="password">
+    <label>Schedule interval (seconds, min 60)</label><input id="im_int" type="number" value="3600">
+    <div class="actions">
+      <button class="btn-green" id="imYes">Save</button>
+      <button class="btn" id="imNo">Cancel</button>
+    </div>
+  </div>
+</div>
 <div class="modal" id="restoreModal">
   <div class="box">
     <h2>Confirm restore</h2>
@@ -147,19 +175,25 @@ function fmt(n){if(n==null)return'–';if(n>=1073741824)return(n/1073741824).toF
 function ua(s){if(!s)return null;try{return new Date(s).toLocaleString()}catch(e){return s}}
 function badge(s){if(s==='ok')return'<span class="badge ok">OK</span>';if(s==='fail')return'<span class="badge fail">FAIL</span>';return'<span class="badge none">never</span>'}
 function msg(el,text,cls){el.className='msg '+(cls||'ok');el.textContent=text}
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+let cur=null, instances=[];
+
 function loadCfg(c){
-  $('cfg_url').value=c.instance_url||'';$('cfg_key').value=c.api_key||'';
-  $('cfg_bk').value=c.backup_endpoint||'/admin-api/backup';$('cfg_rst').value=c.restore_endpoint||'/admin-api/restore';
-  $('cfg_int').value=c.schedule_interval||3600;$('cfg_ingest').value=c.ingest_key||'';
-  $('cfg_hourly').value=(c.retention&&c.retention.hourly)||24;$('cfg_daily').value=(c.retention&&c.retention.daily)||30;$('cfg_weekly').value=(c.retention&&c.retention.weekly)||12;
-  $('cfg_gui').value=c.gui_key||'';$('cfg_gui_user').value=c.gui_user||'';$('cfg_gui_pass').value=c.gui_password||'';$('cfg_smtp_host').value=(c.email&&c.email.smtp_host)||'';$('cfg_smtp_user').value=(c.email&&c.email.smtp_user)||'';
-  $('cfg_smtp_pass').value=(c.email&&c.email.smtp_password)||'';$('cfg_smtp_port').value=(c.email&&c.email.smtp_port)||587;
-  $('cfg_smtp_to').value=(c.email&&c.email.to&&c.email.to.join(', '))||'';
-  $('cfg_email_on').checked=!!(c.email&&c.email.enabled);$('cfg_tls').checked=!(c.email&&c.email.use_tls===false);
+  const inst=c.instance||{};
+  $('cfg_nick').value=inst.nickname||'';$('cfg_url').value=inst.instance_url||'';$('cfg_key').value=inst.api_key||'';
+  $('cfg_bk').value=inst.backup_endpoint||'/api/v1/admin-api/backup';$('cfg_rst').value=inst.restore_endpoint||'/api/v1/admin-api/restore';
+  $('cfg_int').value=inst.schedule_interval||3600;$('cfg_ingest').value=inst.ingest_key||'';
+  $('cfg_enabled').checked=inst.enabled!==false;
+  $('cfg_hourly').value=(inst.retention&&inst.retention.hourly)||24;$('cfg_daily').value=(inst.retention&&inst.retention.daily)||30;$('cfg_weekly').value=(inst.retention&&inst.retention.weekly)||12;
+  const em=c.email||{};
+  $('cfg_smtp_host').value=em.smtp_host||'';$('cfg_smtp_user').value=em.smtp_user||'';
+  $('cfg_smtp_pass').value=em.smtp_password||'';$('cfg_smtp_port').value=em.smtp_port||587;
+  $('cfg_smtp_from').value=em.from||'';$('cfg_smtp_to').value=(em.to&&em.to.join(', '))||'';
+  $('cfg_email_on').checked=!!em.enabled;$('cfg_tls').checked=!(em.use_tls===false);
 }
 function loadStatus(s){
   $('health').innerHTML=[
-    ['Instance',s.instance||'not configured'],
+    ['Instance',s.nickname||s.instance||'not configured'],
     ['Last backup',ua(s.last_backup_at)||'–'],
     ['Last status',badge(s.last_status)+' '+(s.last_error||'').slice(0,60)],
     ['Next run',ua(s.next_run_at)||'–'],
@@ -173,30 +207,55 @@ let tierData={};
 function loadBackups(b){
   tierData=b;
   $('tabs').innerHTML=['hourly','daily','weekly'].map(t=>{
-    const rows=(b[t]||[]).map(x=>`<tr><td>${x.name}</td><td>${fmt(x.size)}</td><td>${ua(x.mtime)}</td><td>
-      <a href="/api/backup/download?name=${encodeURIComponent(x.name)}" download>download</a> ·
-      <a href="#" data-restore="${x.name}">restore</a> · 
-      <a href="#" data-del="${x.name}" style="color:#e74c3c">delete</a></td></tr>`).join('');
+    const rows=(b[t]||[]).map(x=>`<tr><td>${esc(x.name)}</td><td>${fmt(x.size)}</td><td>${ua(x.mtime)}</td><td>
+      <a href="/api/backup/download?instance=${encodeURIComponent(cur)}&name=${encodeURIComponent(x.name)}" download>download</a> ·
+      <a href="#" data-restore="${esc(x.name)}">restore</a> ·
+      <a href="#" data-del="${esc(x.name)}" style="color:#e74c3c">delete</a></td></tr>`).join('');
     return `<div style="margin-bottom:14px"><h3 style="margin:6px 0;color:#8a93a3;font-size:12px;text-transform:uppercase">${t}</h3>
       ${rows?`<table><tr><th>file</th><th>size</th><th>created</th><th></th></tr>${rows}</table>`:'<small>no backups yet</small>'}</div>`;
   }).join('');
   document.querySelectorAll('[data-restore]').forEach(a=>a.onclick=ev=>{ev.preventDefault();openRestore(a.dataset.restore)});
   document.querySelectorAll('[data-del]').forEach(a=>a.onclick=ev=>{ev.preventDefault();del(a.dataset.del)});
 }
-function openRestore(name){
-  $('rmName').textContent=name;$('rmConfirm').value='';$('rmYes').disabled=true;$('restoreModal').style.display='flex';
+function renderInstances(){
+  const el=$('instList');
+  if(!instances.length){el.innerHTML='<div class="empty">No instances yet — add one to start backing up.</div>';return;}
+  el.innerHTML=instances.map(i=>{
+    const sel=i.id===cur;
+    const name=esc(i.nickname||i.instance_url||i.id);
+    const sub=i.instance_url?esc(i.instance_url):'<small>not configured</small>';
+    return `<div class="inst ${sel?'sel':''}">
+      <span style="flex:1">
+        <b>${name}</b>
+        <small>${badge(i.last_status)} ${sub}</small>
+      </span>
+      <span class="badge ${i.enabled?'ok':'none'}" title="${i.enabled?'enabled':'disabled'}">${i.enabled?'on':'off'}</span>
+      <button class="btn btn-sm" data-sel="${esc(i.id)}">Select</button>
+      <button class="btn btn-sm" data-ren="${esc(i.id)}">Rename</button>
+      <button class="btn btn-sm" style="background:var(--red);color:#fff" data-del="${esc(i.id)}">Delete</button>
+    </div>`;
+  }).join('');
+  el.querySelectorAll('[data-sel]').forEach(b=>b.onclick=()=>{cur=b.dataset.sel;refresh();});
+  el.querySelectorAll('[data-ren]').forEach(b=>b.onclick=()=>openRename(b.dataset.ren));
+  el.querySelectorAll('[data-del]').forEach(b=>b.onclick=()=>removeInst(b.dataset.del));
 }
-async function del(name){
-  if(!confirm('Delete '+name+'?'))return;
-  try{await call('DELETE','/api/backup/delete?name='+encodeURIComponent(name));await refresh();}
-  catch(e){msg($('restoreMsg'),e.message,'err')}
+async function loadDetail(){
+  const q='?instance='+encodeURIComponent(cur);
+  const s=await call('GET','/api/status'+q);loadStatus(s);
+  const c=await call('GET','/api/config'+q);loadCfg(c);
+  const b=await call('GET','/api/backups'+q);loadBackups(b);
+  $('healthCard').style.display='';$('cfgCard').style.display='';$('bkCard').style.display='';
+  $('runNow').disabled=false;
 }
 async function refresh(){
   try{
-    const s=await call('GET','/api/status');loadStatus(s);
-    const c=await call('GET','/api/config');loadCfg(c);
-    const b=await call('GET','/api/backups');loadBackups(b);
-  }catch(e){msg($('cfgMsg'),'Connection failed: '+e.message,'err')}
+    const r=await call('GET','/api/instances');instances=r.instances||[];
+    if(cur && !instances.some(i=>i.id===cur))cur=null;
+    if(!cur && instances.length)cur=instances[0].id;
+    renderInstances();
+    if(cur){await loadDetail();}
+    else{$('healthCard').style.display='none';$('cfgCard').style.display='none';$('bkCard').style.display='none';$('runNow').disabled=true;}
+  }catch(e){msg($('instMsg'),'Connection failed: '+e.message,'err')}
 }
 async function unlock(){
   try{
@@ -206,30 +265,82 @@ async function unlock(){
     $('gate').style.display='none';refresh();
   }catch(e){$('gateErr').textContent=e.message;}
 }
+function openAdd(){
+  $('instModalTitle').textContent='Add instance';
+  $('im_nick').value='';$('im_url').value='';$('im_key').value='';$('im_int').value='3600';
+  $('instModal').dataset.mode='add';
+  $('instModal').style.display='flex';
+}
+function openRename(id){
+  const i=instances.find(x=>x.id===id);if(!i)return;
+  $('instModalTitle').textContent='Rename instance';
+  $('im_nick').value=i.nickname||i.instance_url||'';
+  $('im_url').value='';$('im_key').value='';$('im_int').value='3600';
+  $('im_url').parentElement.querySelector('label').textContent='Instance URL';
+  $('instModal').dataset.mode='ren';
+  $('instModal').dataset.id=id;
+  $('instModal').style.display='flex';
+}
+$('imNo').onclick=()=>$('instModal').style.display='none';
+$('imYes').onclick=async()=>{
+  const mode=$('instModal').dataset.mode;
+  try{
+    if(mode==='add'){
+      const r=await call('POST','/api/instances',{nickname:$('im_nick').value.trim(),instance_url:$('im_url').value.trim(),api_key:$('im_key').value,schedule_interval:parseInt($('im_int').value)||3600});
+      cur=r.instance.id;
+    }else{
+      await call('POST','/api/instances/update',{id:$('instModal').dataset.id,nickname:$('im_nick').value.trim()});
+    }
+    $('instModal').style.display='none';
+    msg($('instMsg'),mode==='add'?'Instance added.':'Instance renamed.','ok');
+    await refresh();
+  }catch(e){msg($('instMsg'),e.message,'err')}
+};
+async function removeInst(id){
+  if(!confirm('Delete instance '+id+'? Backup archives on disk are kept, but it will no longer be scheduled.'))return;
+  try{await call('DELETE','/api/instances?instance='+encodeURIComponent(id));if(cur===id)cur=null;await refresh();}
+  catch(e){msg($('instMsg'),e.message,'err')}
+}
+function openRestore(name){
+  $('rmName').textContent=name;$('rmConfirm').value='';$('rmYes').disabled=true;$('restoreModal').style.display='flex';
+}
+async function del(name){
+  if(!confirm('Delete '+name+'?'))return;
+  try{await call('DELETE','/api/backup/delete?instance='+encodeURIComponent(cur)+'&name='+encodeURIComponent(name));await loadDetail();}
+  catch(e){msg($('restoreMsg'),e.message,'err')}
+}
 $('gateBtn').onclick=unlock;$('gatePass').onkeydown=e=>{if(e.key==='Enter')unlock()};
+$('addInst').onclick=openAdd;
 $('saveCfg').onclick=async()=>{
   const to=$('cfg_smtp_to').value.split(',').map(s=>s.trim()).filter(Boolean);
-  const cfg={
-    instance_url:$('cfg_url').value.trim(),api_key:$('cfg_key').value,
+  const body={
+    instance_id:cur,
+    nickname:$('cfg_nick').value.trim(),instance_url:$('cfg_url').value.trim(),api_key:$('cfg_key').value,
     backup_endpoint:$('cfg_bk').value.trim(),restore_endpoint:$('cfg_rst').value.trim(),
-    schedule_interval:parseInt($('cfg_int').value)||3600,
-    ingest_key:$('cfg_ingest').value,gui_key:$('cfg_gui').value,
-    gui_user:$('cfg_gui_user').value.trim(),gui_password:$('cfg_gui_pass').value,
+    schedule_interval:parseInt($('cfg_int').value)||3600,enabled:$('cfg_enabled').checked,
+    ingest_key:$('cfg_ingest').value,
     retention:{hourly:parseInt($('cfg_hourly').value)||0,daily:parseInt($('cfg_daily').value)||0,weekly:parseInt($('cfg_weekly').value)||0},
     email:{enabled:$('cfg_email_on').checked,smtp_host:$('cfg_smtp_host').value.trim(),
       smtp_port:parseInt($('cfg_smtp_port').value)||587,smtp_user:$('cfg_smtp_user').value.trim(),
       smtp_password:$('cfg_smtp_pass').value,use_tls:$('cfg_tls').checked,
-      from:$('cfg_smtp_user').value.trim(),to:to}
+      from:$('cfg_smtp_from').value.trim(),to:to}
   };
-  try{await call('POST','/api/config',cfg);msg($('cfgMsg'),'Configuration saved.','ok');refresh();}
+  try{await call('POST','/api/config',body);msg($('cfgMsg'),'Configuration saved.','ok');await refresh();}
   catch(e){msg($('cfgMsg'),e.message,'err')}
+};
+$('testEmail').onclick=async()=>{
+  const b=$('testEmail');b.disabled=true;b.textContent='Sending…';
+  try{const r=await call('POST','/api/email/test');msg($('cfgMsg'),r.ok?'Test email sent.':'Test email failed: '+(r.error||'unknown error'),r.ok?'ok':'err');}
+  catch(e){msg($('cfgMsg'),e.message,'err')}
+  b.disabled=false;b.textContent='Test email';
 };
 $('runNow').onclick=async()=>{
   const b=$('runNow');b.disabled=true;b.textContent='Running…';
-  try{const r=await call('POST','/api/backup/run');msg($('cfgMsg'),r.ok?('Backup saved: '+r.name):('Failed: '+r.error),r.ok?'ok':'err');}
+  try{const r=await call('POST','/api/backup/run?instance='+encodeURIComponent(cur));msg($('cfgMsg'),r.ok?('Backup saved: '+r.name):('Failed: '+r.error),r.ok?'ok':'err');}
   catch(e){msg($('cfgMsg'),e.message,'err')}
-  b.disabled=false;b.textContent='Run backup now';refresh();
+  b.disabled=false;b.textContent='Run backup now';await refresh();
 };
+$('delInst').onclick=()=>removeInst(cur);
 $('restoreBtn').onclick=()=>{
   const f=$('restoreFile').files[0];if(!f)return;
   const rd=new FileReader();
@@ -248,16 +359,11 @@ $('rmYes').onclick=async()=>{
   let body={confirm:true};
   if($('rmUpload').value)body={confirm:true,content_b64:$('rmUpload').value,filename:n};
   else body={confirm:true,name:n};
-  try{const r=await call('POST','/api/backup/restore',body);msg($('restoreMsg'),'Restore complete: '+r.restored,'ok');}
+  try{const r=await call('POST','/api/backup/restore?instance='+encodeURIComponent(cur),body);msg($('restoreMsg'),'Restore complete: '+r.restored,'ok');}
   catch(e){msg($('restoreMsg'),e.message,'err')}
   $('restoreModal').style.display='none';$('rmUpload').value='';
 };
-$('newBackupFolder').onclick=async()=>{
-  if(!confirm('Reset backup folder to /backups?'))return;
-  try{await call('POST','/api/config',{backup_dir:'/backups'});await refresh();}catch(e){}
-};
 fetch('/api/version').then(r=>r.json()).then(v=>$('version').textContent=v.version).catch(()=>{});
-if(location.protocol==='file:'||1){/* gate handled by unlock flow */}
 </script>
 </body>
 </html>

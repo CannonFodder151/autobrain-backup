@@ -8,6 +8,11 @@ Deterministic, stdlib-only backup logic for the autobrain-backup service:
   * restore - push a stored backup back into an AutoBrain instance
   * mail   - SMTP alerts on job failure and corruption (stdlib smtplib)
 
+Multi-tenant: one config file holds a list of AutoBrain instances. Each
+instance has its own nickname, admin credentials, retention, schedule and
+backup folder (``{backup_dir}/{instance_id}`` by default). Run state for each
+instance lives in ``{backup_dir}/{instance_id}/state.json``.
+
 Backups are full database snapshots, so "combine" means retention tiers:
 the hourly tier keeps the most recent snapshots, the daily tier keeps one
 per day, and the weekly tier keeps one per week. Older tiers prune to the
@@ -18,6 +23,7 @@ import copy
 import json
 import os
 import re
+import secrets
 import shutil
 import smtplib
 import ssl
@@ -34,17 +40,12 @@ KIND_BACKUP = "backup"
 HEADER_KEY = "X-Admin-API-Key"
 
 DEFAULT_CONFIG = {
-    "instance_url": "",
-    "api_key": "",
-    "backup_endpoint": "/admin-api/backup",
-    "restore_endpoint": "/admin-api/restore",
-    "backup_dir": "/backups",
-    "schedule_interval": 3600,
+    "version": 2,
     "gui_key": "",
     "gui_user": "",
     "gui_password": "",
     "ingest_key": "",
-    "retention": {"hourly": 24, "daily": 30, "weekly": 12},
+    "backup_dir": "/backups",
     "email": {
         "enabled": False,
         "smtp_host": "",
@@ -55,10 +56,24 @@ DEFAULT_CONFIG = {
         "from": "",
         "to": [],
     },
+    "instances": [],
+}
+
+DEFAULT_INSTANCE = {
+    "nickname": "",
+    "instance_url": "",
+    "api_key": "",
+    "backup_endpoint": "/api/v1/admin-api/backup",
+    "restore_endpoint": "/api/v1/admin-api/restore",
+    "schedule_interval": 3600,
+    "ingest_key": "",
+    "retention": {"hourly": 24, "daily": 30, "weekly": 12},
+    "enabled": True,
+    "backup_dir": "",
 }
 
 MASKED_KEYS = {"api_key", "gui_key", "gui_password", "ingest_key", "smtp_password"}
-_HDRS = {"Accept": "application/json", "User-Agent": "autobrain-backup/1.0"}
+_HDRS = {"Accept": "application/json", "User-Agent": "autobrain-backup/2.0"}
 
 
 class BackupError(Exception):
@@ -95,40 +110,67 @@ class Mailer:
         return bool(self.cfg.get("enabled") and self.cfg.get("smtp_host"))
 
     def send(self, subject, body):
+        return self._send(subject, body)[0]
+
+    def test(self):
+        return self._send("[AutoBrain Backup] test email",
+                          "This is a test email from AutoBrain Backup.\n\n"
+                          f"Sent {_utcnow().isoformat()}.")
+
+    def _send(self, subject, body):
         if not self.enabled():
-            return False
+            return False, "email alerts are disabled"
         to = self.cfg.get("to") or []
         if isinstance(to, str):
             to = [t.strip() for t in to.split(",") if t.strip()]
         if not to:
-            return False
+            return False, "no recipients configured"
+        from_addr = self.cfg.get("from") or self.cfg.get("smtp_user") or ""
+        if not from_addr:
+            return False, "no sender address configured"
         try:
             msg = (
-                f"From: {self.cfg.get('from') or self.cfg.get('smtp_user')}\n"
+                f"From: {from_addr}\n"
                 f"To: {', '.join(to)}\n"
                 f"Subject: {subject}\n\n"
                 f"{body}\n"
             )
+            host = self.cfg["smtp_host"]
+            port = int(self.cfg.get("smtp_port", 587))
             if self.cfg.get("use_tls", True):
-                with smtplib.SMTP(self.cfg["smtp_host"], int(self.cfg.get("smtp_port", 587)), timeout=30) as s:
+                with smtplib.SMTP(host, port, timeout=30) as s:
                     s.ehlo()
                     s.starttls(context=ssl.create_default_context())
                     s.ehlo()
                     if self.cfg.get("smtp_user"):
                         s.login(self.cfg["smtp_user"], self.cfg.get("smtp_password", ""))
-                    s.sendmail(self.cfg.get("from") or self.cfg["smtp_user"], to, msg)
+                    s.sendmail(from_addr, to, msg)
             else:
-                with smtplib.SMTP(self.cfg["smtp_host"], int(self.cfg.get("smtp_port", 587)), timeout=30) as s:
+                with smtplib.SMTP(host, port, timeout=30) as s:
                     if self.cfg.get("smtp_user"):
                         s.login(self.cfg["smtp_user"], self.cfg.get("smtp_password", ""))
-                    s.sendmail(self.cfg.get("from") or self.cfg["smtp_user"], to, msg)
-            return True
-        except Exception:
-            return False
+                    s.sendmail(from_addr, to, msg)
+            return True, None
+        except Exception as e:
+            return False, str(e)
+
+
+def _merge(base, overlay):
+    for k, v in overlay.items():
+        if isinstance(v, dict) and isinstance(base.get(k), dict):
+            base[k] = _merge(base[k], v)
+        else:
+            base[k] = v
+    return base
 
 
 class Config:
-    """Config file lives on the docker host (mounted folder); edited via GUI."""
+    """Config file lives on the docker host (mounted folder); edited via GUI.
+
+    v2 format: a top-level ``instances`` list plus global GUI auth and SMTP
+    alert settings. An existing v1 single-instance config is migrated into a
+    single instance on load (data stays in place).
+    """
 
     def __init__(self, path):
         self.path = Path(path)
@@ -136,21 +178,72 @@ class Config:
         self._cfg = self._load()
 
     def _load(self):
+        base = copy.deepcopy(DEFAULT_CONFIG)
+        raw = {}
         if self.path.exists():
             try:
-                return self._merge(copy.deepcopy(DEFAULT_CONFIG), json.loads(self.path.read_text("utf-8")))
+                raw = json.loads(self.path.read_text("utf-8"))
             except (json.JSONDecodeError, OSError):
-                return copy.deepcopy(DEFAULT_CONFIG)
-        return copy.deepcopy(DEFAULT_CONFIG)
+                raw = {}
+        if not isinstance(raw, dict):
+            raw = {}
+        base = _merge(base, raw)
+        instances = []
+        if isinstance(raw.get("instances"), list):
+            for inst in raw["instances"]:
+                if isinstance(inst, dict):
+                    instances.append(self.normalize_instance(inst))
+        elif raw.get("instance_url"):
+            # v1 single-instance config -> wrap into one instance, keep its data dir
+            inst = {
+                "id": "inst_default",
+                "nickname": raw.get("nickname", ""),
+                "instance_url": raw.get("instance_url", ""),
+                "api_key": raw.get("api_key", ""),
+                "backup_endpoint": raw.get("backup_endpoint") or DEFAULT_INSTANCE["backup_endpoint"],
+                "restore_endpoint": raw.get("restore_endpoint") or DEFAULT_INSTANCE["restore_endpoint"],
+                "schedule_interval": raw.get("schedule_interval", 3600),
+                "ingest_key": raw.get("ingest_key", ""),
+                "retention": raw.get("retention") or copy.deepcopy(DEFAULT_INSTANCE["retention"]),
+                "enabled": True,
+                "backup_dir": raw.get("backup_dir", ""),
+            }
+            instances.append(self.normalize_instance(inst))
+        base["instances"] = instances
+        base["version"] = 2
+        return base
 
     @staticmethod
-    def _merge(base, overlay):
-        for k, v in overlay.items():
-            if isinstance(v, dict) and isinstance(base.get(k), dict):
-                base[k] = Config._merge(base[k], v)
-            else:
-                base[k] = v
-        return base
+    def normalize_instance(inst):
+        out = {}
+        inst = inst or {}
+        out["id"] = str(inst.get("id") or "inst_" + secrets.token_hex(6))
+        out["nickname"] = str(inst.get("nickname") or "").strip()
+        out["instance_url"] = str(inst.get("instance_url") or "").strip().rstrip("/")
+        out["api_key"] = str(inst.get("api_key") or "")
+        out["backup_endpoint"] = str(inst.get("backup_endpoint") or DEFAULT_INSTANCE["backup_endpoint"]).strip()
+        out["restore_endpoint"] = str(inst.get("restore_endpoint") or DEFAULT_INSTANCE["restore_endpoint"]).strip()
+        for e in ("backup_endpoint", "restore_endpoint"):
+            if not out[e].startswith("/"):
+                out[e] = "/" + out[e]
+        try:
+            out["schedule_interval"] = max(60, int(inst.get("schedule_interval", 3600)))
+        except (TypeError, ValueError):
+            out["schedule_interval"] = 3600
+        out["ingest_key"] = str(inst.get("ingest_key") or "")
+        ret = {}
+        src = inst.get("retention") or {}
+        if not isinstance(src, dict):
+            src = {}
+        for tier in ("hourly", "daily", "weekly"):
+            try:
+                ret[tier] = max(0, int(src.get(tier, DEFAULT_INSTANCE["retention"][tier])))
+            except (TypeError, ValueError):
+                ret[tier] = DEFAULT_INSTANCE["retention"][tier]
+        out["retention"] = ret
+        out["enabled"] = bool(inst.get("enabled", True))
+        out["backup_dir"] = str(inst.get("backup_dir") or "").strip()
+        return out
 
     def get(self):
         with self._lock:
@@ -164,33 +257,90 @@ class Config:
         for k, v in (cfg.get("email") or {}).items():
             if k in MASKED_KEYS and v:
                 cfg["email"][k] = "********"
+        for inst in cfg.get("instances") or []:
+            for k, v in inst.items():
+                if k in MASKED_KEYS and v:
+                    inst[k] = "********"
         return cfg
 
-    def save(self, new_cfg):
-        new_cfg = self._merge(self.get(), new_cfg)
-        for k in ("instance_url", "api_key", "backup_endpoint", "restore_endpoint"):
-            new_cfg[k] = str(new_cfg.get(k) or "").strip()
-        new_cfg["backup_dir"] = str(new_cfg.get("backup_dir") or "").strip() or "/backups"
-        try:
-            new_cfg["schedule_interval"] = max(60, int(new_cfg.get("schedule_interval", 3600)))
-        except (TypeError, ValueError):
-            new_cfg["schedule_interval"] = 3600
-        for tier in ("hourly", "daily", "weekly"):
-            try:
-                new_cfg["retention"][tier] = max(0, int(new_cfg.get("retention", {}).get(tier, DEFAULT_CONFIG["retention"][tier])))
-            except (TypeError, ValueError):
-                new_cfg["retention"][tier] = DEFAULT_CONFIG["retention"][tier]
+    def instances(self):
+        return self.get().get("instances") or []
+
+    def get_instance(self, iid):
+        for inst in self.instances():
+            if inst.get("id") == iid:
+                return inst
+        return None
+
+    def add_instance(self, data):
+        inst = self.normalize_instance(dict(data or {}))
         with self._lock:
+            self._cfg["instances"].append(inst)
+            self._persist()
+        return inst
+
+    def update_instance(self, iid, data):
+        with self._lock:
+            for i, inst in enumerate(self._cfg.get("instances") or []):
+                if inst.get("id") != iid:
+                    continue
+                merged = _merge(inst, dict(data or {}))
+                self._cfg["instances"][i] = self.normalize_instance(merged)
+                self._persist()
+                return self._cfg["instances"][i]
+        return None
+
+    def remove_instance(self, iid):
+        with self._lock:
+            before = len(self._cfg.get("instances") or [])
+            self._cfg["instances"] = [i for i in self._cfg.get("instances") or [] if i.get("id") != iid]
+            if len(self._cfg["instances"]) != before:
+                self._persist()
+                return True
+        return False
+
+    def save(self, new_cfg):
+        new_cfg = _merge(self.get(), new_cfg)
+        for k in ("gui_key", "gui_user", "gui_password", "ingest_key"):
+            if isinstance(new_cfg.get(k), str):
+                new_cfg[k] = new_cfg[k].strip()
+        new_cfg["backup_dir"] = str(new_cfg.get("backup_dir") or "").strip() or "/backups"
+        email = new_cfg.get("email") or {}
+        if isinstance(email, dict):
+            email["smtp_host"] = str(email.get("smtp_host") or "").strip()
+            try:
+                email["smtp_port"] = max(1, int(email.get("smtp_port", 587)))
+            except (TypeError, ValueError):
+                email["smtp_port"] = 587
+            email["smtp_user"] = str(email.get("smtp_user") or "").strip()
+            email["from"] = str(email.get("from") or "").strip()
+            email["use_tls"] = bool(email.get("use_tls", True))
+            email["enabled"] = bool(email.get("enabled"))
+            to = email.get("to") or []
+            if isinstance(to, str):
+                to = [t.strip() for t in to.split(",") if t.strip()]
+            email["to"] = [str(t).strip() for t in to if str(t).strip()]
+            new_cfg["email"] = email
+        if isinstance(new_cfg.get("instances"), list):
+            new_cfg["instances"] = [self.normalize_instance(i) for i in new_cfg["instances"] if isinstance(i, dict)]
+        new_cfg["version"] = 2
+        with self._lock:
+            self._cfg = new_cfg
+            self._persist()
+        return new_cfg
+
+    def _persist(self):
+        try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(new_cfg, indent=2), "utf-8")
+            tmp.write_text(json.dumps(self._cfg, indent=2), "utf-8")
             os.replace(tmp, self.path)
-            self._cfg = new_cfg
-        return new_cfg
+        except OSError:
+            pass
 
 
 class State:
-    """Persistent run state: last run, health, archive promotion cursors."""
+    """Persistent per-instance run state: last run, health, archive cursors."""
 
     FIELDS = {"last_run", "last_status", "last_error", "last_backup_at",
               "next_run_at", "last_daily_date", "last_weekly_date", "counters"}
@@ -234,10 +384,17 @@ class State:
 
 
 class BackupEngine:
-    def __init__(self, config, state, backup_dir=None):
-        self.config = config
+    def __init__(self, instance, state, backup_dir, email_cfg):
+        self.instance = instance
         self.state = state
-        self.backup_dir = Path(backup_dir or config.get().get("backup_dir") or "/backups")
+        self.backup_dir = Path(backup_dir)
+        self.email_cfg = email_cfg or {}
+
+    def _cfg(self, key, default=None):
+        return self.instance.get(key, default)
+
+    def label(self):
+        return self._cfg("nickname") or self._cfg("instance_url") or self.instance.get("id", "?")
 
     # --- transport ---
     def _opener(self):
@@ -315,12 +472,11 @@ class BackupEngine:
 
     def run_backup(self):
         """Fetch, validate, save and rotate. Returns the saved backup name."""
-        cfg = self.config.get()
-        url = str(cfg.get("instance_url") or "").rstrip("/")
-        key = cfg.get("api_key") or ""
+        url = str(self._cfg("instance_url") or "").rstrip("/")
+        key = self._cfg("api_key") or ""
         if not url or not key:
             raise BackupError("instance_url and api_key are required in config")
-        endpoint = str(cfg.get("backup_endpoint") or "/admin-api/backup")
+        endpoint = str(self._cfg("backup_endpoint") or "/api/v1/admin-api/backup")
         if not endpoint.startswith("/"):
             endpoint = "/" + endpoint
         body, _ct = self._fetch(url + endpoint, key)
@@ -332,9 +488,8 @@ class BackupEngine:
         return path.name
 
     def ingest(self, body, expected_key):
-        """Accept a backup pushed by the autobrain-backup-agent."""
-        cfg = self.config.get()
-        configured = cfg.get("ingest_key") or ""
+        """Accept a backup pushed by the autobrain-backup-agent for this instance."""
+        configured = self._cfg("ingest_key") or ""
         if expected_key and configured and expected_key != configured:
             raise BackupError("invalid ingest key")
         path, data = self._save_body(body)
@@ -346,8 +501,7 @@ class BackupEngine:
 
     def rotate(self):
         """Promote hourly -> daily (once/day) and daily -> weekly (once/week), then prune."""
-        cfg = self.config.get()
-        ret = cfg.get("retention") or {}
+        ret = self._cfg("retention") or {}
         hourly = self._hourly_dir()
         hourly.mkdir(parents=True, exist_ok=True)
         daily = self._daily_dir()
@@ -397,15 +551,14 @@ class BackupEngine:
         """Push a stored backup back to the instance. Wipes existing data."""
         if not confirm:
             raise BackupError("restore requires confirm=true")
-        cfg = self.config.get()
-        url = str(cfg.get("instance_url") or "").rstrip("/")
-        key = cfg.get("api_key") or ""
+        url = str(self._cfg("instance_url") or "").rstrip("/")
+        key = self._cfg("api_key") or ""
         if not url or not key:
             raise BackupError("instance_url and api_key are required in config")
         path = self._resolve_source(source)
         body = path.read_bytes()
         self.validate(body)  # corruption gate before we wipe anything
-        endpoint = str(cfg.get("restore_endpoint") or "/admin-api/restore")
+        endpoint = str(self._cfg("restore_endpoint") or "/api/v1/admin-api/restore")
         if not endpoint.startswith("/"):
             endpoint = "/" + endpoint
         boundary = "----autobrainbackup"
@@ -466,16 +619,18 @@ class BackupEngine:
         return out
 
     def status(self):
-        cfg = self.config.get()
         st = self.state.get()
         disk = shutil.disk_usage(self.backup_dir) if self.backup_dir.exists() else None
         return {
-            "instance": cfg.get("instance_url") or None,
-            "configured": bool(cfg.get("instance_url") and cfg.get("api_key")),
-            "email_enabled": self._mailer(cfg).enabled(),
-            "ingest_enabled": bool(cfg.get("ingest_key")),
-            "schedule_interval": cfg.get("schedule_interval"),
-            "retention": cfg.get("retention"),
+            "id": self.instance.get("id"),
+            "nickname": self._cfg("nickname"),
+            "instance": self._cfg("instance_url") or None,
+            "configured": bool(self._cfg("instance_url") and self._cfg("api_key")),
+            "enabled": self._cfg("enabled", True),
+            "email_enabled": self._mailer().enabled(),
+            "ingest_enabled": bool(self._cfg("ingest_key")),
+            "schedule_interval": self._cfg("schedule_interval"),
+            "retention": self._cfg("retention"),
             "last_run": st.get("last_run"),
             "last_status": st.get("last_status"),
             "last_error": st.get("last_error"),
@@ -489,15 +644,17 @@ class BackupEngine:
             "backups": {t: len(v) for t, v in self.list_backups().items()},
         }
 
-    def _mailer(self, cfg=None):
-        return Mailer(cfg or self.config.get())
+    def _mailer(self):
+        return Mailer({"email": self.email_cfg})
 
     def alert_failure(self, error):
-        self._mailer().send("[AutoBrain Backup] job failed", f"A backup run failed:\n\n{error}")
+        self._mailer().send(f"[AutoBrain Backup] {self.label()}: job failed",
+                            f"A backup run for {self.label()} failed:\n\n{error}")
 
     def alert_corruption(self, error):
-        self._mailer().send("[AutoBrain Backup] corrupt backup detected", f"A corrupted or invalid backup was rejected:\n\n{error}")
+        self._mailer().send(f"[AutoBrain Backup] {self.label()}: corrupt backup detected",
+                            f"A corrupted or invalid backup for {self.label()} was rejected:\n\n{error}")
 
     def alert_restore(self, status, name):
-        self._mailer().send("[AutoBrain Backup] restore completed",
-                            f"Restore of {name} completed with HTTP {status}.")
+        self._mailer().send(f"[AutoBrain Backup] {self.label()}: restore completed",
+                            f"Restore of {name} on {self.label()} completed with HTTP {status}.")

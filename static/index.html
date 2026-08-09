@@ -48,9 +48,10 @@ small{color:var(--muted)}
 <div class="gate" id="gate">
   <div class="box">
     <h2>AutoBrain Backup</h2>
-    <p><small>This instance is protected by a GUI key. Enter it to continue.</small></p>
-    <input type="password" id="gateKey" placeholder="GUI key">
-    <div class="actions"><button class="btn" id="gateBtn">Unlock</button></div>
+    <p><small>Sign in to open the console.</small></p>
+    <input type="text" id="gateUser" placeholder="Username" autocomplete="username">
+    <input type="password" id="gatePass" placeholder="Password" autocomplete="current-password" style="margin-top:8px">
+    <div class="actions"><button class="btn" id="gateBtn">Sign in</button></div>
     <div class="msg err" id="gateErr"></div>
   </div>
 </div>
@@ -85,7 +86,11 @@ small{color:var(--muted)}
       <div><label>Retain weekly</label><input id="cfg_weekly" type="number" min="0" value="12"></div>
     </div>
     <div class="row">
-      <div><label>GUI key (empty = open)</label><input id="cfg_gui" type="password"></div>
+      <div><label>Login username (empty = open console)</label><input id="cfg_gui_user"></div>
+      <div><label>Login password</label><input id="cfg_gui_pass" type="password"></div>
+    </div>
+    <div class="row">
+      <div><label>Legacy GUI key (API clients, optional)</label><input id="cfg_gui" type="password"></div>
       <div><label>SMTP host</label><input id="cfg_smtp_host"></div>
     </div>
     <div class="row">
@@ -130,10 +135,8 @@ small{color:var(--muted)}
 </div>
 <script>
 const $=id=>document.getElementById(id), api={};
-let guiKey='';
 async function call(method,path,body){
   const h={};
-  if(guiKey)h['X-Gui-Key']=guiKey;
   if(body)h['Content-Type']='application/json';
   const r=await fetch(path,{method,headers:h,body:body?JSON.stringify(body):undefined});
   const t=await r.text();const d=t?JSON.parse(t):{};
@@ -149,7 +152,7 @@ function loadCfg(c){
   $('cfg_bk').value=c.backup_endpoint||'/admin-api/backup';$('cfg_rst').value=c.restore_endpoint||'/admin-api/restore';
   $('cfg_int').value=c.schedule_interval||3600;$('cfg_ingest').value=c.ingest_key||'';
   $('cfg_hourly').value=(c.retention&&c.retention.hourly)||24;$('cfg_daily').value=(c.retention&&c.retention.daily)||30;$('cfg_weekly').value=(c.retention&&c.retention.weekly)||12;
-  $('cfg_gui').value=c.gui_key||'';$('cfg_smtp_host').value=(c.email&&c.email.smtp_host)||'';$('cfg_smtp_user').value=(c.email&&c.email.smtp_user)||'';
+  $('cfg_gui').value=c.gui_key||'';$('cfg_gui_user').value=c.gui_user||'';$('cfg_gui_pass').value=c.gui_password||'';$('cfg_smtp_host').value=(c.email&&c.email.smtp_host)||'';$('cfg_smtp_user').value=(c.email&&c.email.smtp_user)||'';
   $('cfg_smtp_pass').value=(c.email&&c.email.smtp_password)||'';$('cfg_smtp_port').value=(c.email&&c.email.smtp_port)||587;
   $('cfg_smtp_to').value=(c.email&&c.email.to&&c.email.to.join(', '))||'';
   $('cfg_email_on').checked=!!(c.email&&c.email.enabled);$('cfg_tls').checked=!(c.email&&c.email.use_tls===false);
@@ -197,12 +200,13 @@ async function refresh(){
 }
 async function unlock(){
   try{
-    guiKey=$('gateKey').value;
-    await call('GET','/api/status');
+    const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:$('gateUser').value,password:$('gatePass').value})});
+    const t=await r.text();const d=t?JSON.parse(t):{};
+    if(!r.ok)throw new Error(d.error||('HTTP '+r.status));
     $('gate').style.display='none';refresh();
-  }catch(e){$('gateErr').textContent=e.message;guiKey='';}
+  }catch(e){$('gateErr').textContent=e.message;}
 }
-$('gateBtn').onclick=unlock;$('gateKey').onkeydown=e=>{if(e.key==='Enter')unlock()};
+$('gateBtn').onclick=unlock;$('gatePass').onkeydown=e=>{if(e.key==='Enter')unlock()};
 $('saveCfg').onclick=async()=>{
   const to=$('cfg_smtp_to').value.split(',').map(s=>s.trim()).filter(Boolean);
   const cfg={
@@ -210,6 +214,7 @@ $('saveCfg').onclick=async()=>{
     backup_endpoint:$('cfg_bk').value.trim(),restore_endpoint:$('cfg_rst').value.trim(),
     schedule_interval:parseInt($('cfg_int').value)||3600,
     ingest_key:$('cfg_ingest').value,gui_key:$('cfg_gui').value,
+    gui_user:$('cfg_gui_user').value.trim(),gui_password:$('cfg_gui_pass').value,
     retention:{hourly:parseInt($('cfg_hourly').value)||0,daily:parseInt($('cfg_daily').value)||0,weekly:parseInt($('cfg_weekly').value)||0},
     email:{enabled:$('cfg_email_on').checked,smtp_host:$('cfg_smtp_host').value.trim(),
       smtp_port:parseInt($('cfg_smtp_port').value)||587,smtp_user:$('cfg_smtp_user').value.trim(),

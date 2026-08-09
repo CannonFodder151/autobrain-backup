@@ -11,7 +11,9 @@ GUI at /config. Run state persists next to it for stats and health.
 
 import argparse
 import base64
+import hmac
 import json
+import secrets
 import sys
 import threading
 import time
@@ -23,7 +25,9 @@ from pathlib import Path
 from engine import BackupEngine, BackupError, Config, State
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
-VERSION = "1.0.0"
+VERSION = "1.1.0"
+
+SESSION_TTL = 24 * 3600
 
 
 class App:
@@ -35,6 +39,23 @@ class App:
         self._sched_stop = threading.Event()
         self._sched = threading.Thread(target=self._scheduler, daemon=True)
         self._sched.start()
+        self._sessions = {}
+
+    def new_session(self):
+        token = secrets.token_urlsafe(32)
+        self._sessions[token] = time.time() + SESSION_TTL
+        return token
+
+    def check_session(self, token):
+        if not token:
+            return False
+        exp = self._sessions.get(token)
+        if not exp:
+            return False
+        if time.time() > exp:
+            self._sessions.pop(token, None)
+            return False
+        return True
 
     # --- scheduler ---
     def _scheduler(self):
@@ -128,9 +149,22 @@ class Handler(BaseHTTPRequestHandler):
     def _authorized(self):
         cfg = self.app.config.get()
         key = cfg.get("gui_key") or ""
-        if not key:
+        user = cfg.get("gui_user") or ""
+        if not key and not user:
             return True
-        return self.headers.get("X-Gui-Key") == key or self.headers.get("Authorization", "").replace("Bearer ", "") == key
+        if key and (self.headers.get("X-Gui-Key") == key or self.headers.get("Authorization", "").replace("Bearer ", "") == key):
+            return True
+        if user and self.app.check_session(self._cookie("autobrain_session")):
+            return True
+        return False
+
+    def _cookie(self, name):
+        raw = self.headers.get("Cookie") or ""
+        for part in raw.split(";"):
+            k, _, v = part.strip().partition("=")
+            if k == name:
+                return v
+        return None
 
     def _unauthorized(self):
         self._send(401, {"error": "unauthorized"})
@@ -142,8 +176,6 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urllib.parse.urlparse(self.path).path
         if path in ("/", "/index.html"):
-            if not self._authorized():
-                return self._unauthorized()
             try:
                 html = (STATIC_DIR / "index.html").read_text("utf-8")
                 self._send(200, html, "text/html; charset=utf-8")
@@ -172,6 +204,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urllib.parse.urlparse(self.path).path
+        if path == "/api/login":
+            return self._login()
         if path == "/api/config":
             if not self._authorized():
                 return self._unauthorized()
@@ -189,6 +223,28 @@ class Handler(BaseHTTPRequestHandler):
         self._send(404, {"error": "not found"})
 
     # --- handlers ---
+    def _login(self):
+        try:
+            payload = self._read_json()
+        except (json.JSONDecodeError, ValueError):
+            return self._send(400, {"error": "invalid JSON"})
+        username = str(payload.get("username") or "")
+        password = str(payload.get("password") or "")
+        cfg = self.app.config.get()
+        u = cfg.get("gui_user") or ""
+        p = cfg.get("gui_password") or ""
+        if u and hmac.compare_digest(username, u) and hmac.compare_digest(password, p):
+            token = self.app.new_session()
+            body = json.dumps({"ok": True}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Set-Cookie", f"autobrain_session={token}; HttpOnly; Path=/; SameSite=Lax")
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        return self._send(401, {"error": "invalid username or password"})
+
     def _save_config(self):
         try:
             payload = self._read_json()
@@ -198,7 +254,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(400, {"error": "invalid config"})
         # preserve masked values: an all-asterisk field means "keep current"
         current = self.app.config.get()
-        for k in ("api_key", "gui_key", "ingest_key"):
+        for k in ("api_key", "gui_key", "gui_password", "ingest_key"):
             if payload.get(k) == "********":
                 payload[k] = current.get(k)
         email = payload.get("email")

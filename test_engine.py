@@ -139,8 +139,60 @@ def main():
     print("ok: restore from stored backup")
 
     srv.shutdown()
+    test_login()
     shutil.rmtree(tmp, ignore_errors=True)
     print("\nALL CHECKS PASSED")
+
+
+def test_login():
+    import http.client
+    import urllib.request
+
+    import server
+
+    tmp = Path(tempfile.mkdtemp())
+    cfg_path = tmp / "cfg.json"
+    cfg_path.write_text(json.dumps({"gui_user": "admin", "gui_password": "pw", "gui_key": "legacykey"}))
+    app = server.App(cfg_path, tmp / "backups")
+    srv = server.BackupServer(("127.0.0.1", 0), app)
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    base = "http://127.0.0.1:%d" % srv.server_address[1]
+    try:
+        r = urllib.request.urlopen(base + "/", timeout=5)
+        assert r.status == 200 and b"Sign in" in r.read(), "login page not served"
+        print("ok: / serves login page (no raw 401)")
+        try:
+            urllib.request.urlopen(base + "/api/status", timeout=5)
+            raise AssertionError("status open without login")
+        except urllib.error.HTTPError as e:
+            assert e.code == 401, e.code
+        print("ok: api requires login")
+        c = http.client.HTTPConnection("127.0.0.1", srv.server_address[1], timeout=5)
+
+        def post(path, body, cookie=None):
+            c.request("POST", path, body=json.dumps(body), headers={"Content-Type": "application/json", **({"Cookie": cookie} if cookie else {})})
+            r = c.getresponse(); data = r.read(); return r, data
+
+        r, _ = post("/api/login", {"username": "admin", "password": "bad"})
+        assert r.status == 401, r.status
+        print("ok: bad login rejected")
+        r, _ = post("/api/login", {"username": "admin", "password": "pw"})
+        assert r.status == 200, r.status
+        cookie = r.getheader("Set-Cookie").split(";")[0]
+        assert cookie.startswith("autobrain_session="), cookie
+        print("ok: good login sets session cookie")
+        c.request("GET", "/api/status", headers={"Cookie": cookie})
+        r = c.getresponse()
+        assert r.status == 200, r.status
+        print("ok: session cookie authorized")
+        c.request("GET", "/api/status", headers={"X-Gui-Key": "legacykey"})
+        r = c.getresponse()
+        assert r.status == 200, r.status
+        print("ok: legacy gui_key still works")
+    finally:
+        srv.shutdown()
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":

@@ -41,6 +41,8 @@ DEFAULT_CONFIG = {
     "backup_dir": "/backups",
     "schedule_interval": 3600,
     "gui_key": "",
+    "gui_user": "",
+    "gui_password": "",
     "ingest_key": "",
     "retention": {"hourly": 24, "daily": 30, "weekly": 12},
     "email": {
@@ -55,7 +57,7 @@ DEFAULT_CONFIG = {
     },
 }
 
-MASKED_KEYS = {"api_key", "gui_key", "ingest_key", "smtp_password"}
+MASKED_KEYS = {"api_key", "gui_key", "gui_password", "ingest_key", "smtp_password"}
 _HDRS = {"Accept": "application/json", "User-Agent": "autobrain-backup/1.0"}
 
 

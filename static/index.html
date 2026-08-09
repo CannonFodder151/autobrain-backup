@@ -1,0 +1,258 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AutoBrain Backup</title>
+<style>
+:root{--bg:#0e1116;--panel:#171b22;--border:#262c36;--text:#e6e9ef;--muted:#8a93a3;--accent:#3498db;--green:#2ecc71;--red:#e74c3c;--amber:#f39c12;}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+header{display:flex;align-items:center;gap:12px;padding:14px 20px;border-bottom:1px solid var(--border);background:var(--panel)}
+header h1{font-size:16px;margin:0}
+header .tag{color:var(--muted);font-size:12px}
+main{max-width:960px;margin:0 auto;padding:20px;display:grid;gap:16px}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:16px}
+.card h2{margin:0 0 12px;font-size:14px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}
+.stat{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:10px}
+.stat .k{color:var(--muted);font-size:11px;text-transform:uppercase}
+.stat .v{font-size:18px;font-weight:600;margin-top:2px;word-break:break-all}
+.badge{padding:2px 8px;border-radius:999px;font-size:12px;font-weight:600}
+.ok{background:#1b3a2a;color:var(--green)}.fail{background:#3a1b1b;color:var(--red)}.none{background:#3a3418;color:var(--amber)}
+label{display:block;color:var(--muted);font-size:12px;margin:10px 0 4px}
+input,select,textarea{width:100%;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:8px 10px;font:inherit}
+input:focus{border-color:var(--accent);outline:none}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.row3{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+button{cursor:pointer;border:none;border-radius:6px;padding:9px 14px;font:inherit;font-weight:600}
+.btn{background:var(--accent);color:#fff}.btn:hover{filter:brightness(1.1)}
+.btn-green{background:var(--green);color:#06210f}.btn-red{background:var(--red);color:#fff}
+button:disabled{opacity:.5;cursor:not-allowed}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{text-align:left;padding:7px 8px;border-bottom:1px solid var(--border)}
+th{color:var(--muted);font-weight:500}
+a{color:var(--accent)}
+.actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:12px}
+.msg{margin-top:12px;padding:10px;border-radius:6px;display:none;font-size:13px}
+.msg.err{display:block;background:#3a1b1b;border:1px solid var(--red);color:#ffb4b4}
+.msg.ok{display:block;background:#1b3a2a;border:1px solid var(--green);color:#a9f0c3}
+.modal{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;align-items:center;justify-content:center;z-index:10}
+.modal .box{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:20px;max-width:480px;width:90%}
+.gate{position:fixed;inset:0;background:var(--bg);display:flex;align-items:center;justify-content:center;z-index:20}
+.gate .box{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:24px;width:min(360px,90%)}
+small{color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="gate" id="gate">
+  <div class="box">
+    <h2>AutoBrain Backup</h2>
+    <p><small>This instance is protected by a GUI key. Enter it to continue.</small></p>
+    <input type="password" id="gateKey" placeholder="GUI key">
+    <div class="actions"><button class="btn" id="gateBtn">Unlock</button></div>
+    <div class="msg err" id="gateErr"></div>
+  </div>
+</div>
+<header>
+  <h1>AutoBrain Backup</h1>
+  <span class="tag">web console · <span id="version">…</span></span>
+  <span style="flex:1"></span>
+  <button class="btn" id="runNow">Run backup now</button>
+</header>
+<main id="app">
+  <div class="card" id="healthCard">
+    <h2>Health &amp; stats</h2>
+    <div class="grid" id="health"></div>
+  </div>
+  <div class="card">
+    <h2>Configuration</h2>
+    <div class="row">
+      <div><label>AutoBrain instance URL</label><input id="cfg_url" placeholder="https://app.autobrainservice.app"></div>
+      <div><label>Admin API key (X-Admin-API-Key)</label><input id="cfg_key" type="password" placeholder="admin API key"></div>
+    </div>
+    <div class="row">
+      <div><label>Backup endpoint</label><input id="cfg_bk" value="/admin-api/backup"></div>
+      <div><label>Restore endpoint</label><input id="cfg_rst" value="/admin-api/restore"></div>
+    </div>
+    <div class="row">
+      <div><label>Schedule interval (seconds)</label><input id="cfg_int" type="number" min="60" value="3600"></div>
+      <div><label>Ingest key (optional, for autobrain-backup-agent push)</label><input id="cfg_ingest" type="password"></div>
+    </div>
+    <div class="row3">
+      <div><label>Retain hourly</label><input id="cfg_hourly" type="number" min="0" value="24"></div>
+      <div><label>Retain daily</label><input id="cfg_daily" type="number" min="0" value="30"></div>
+      <div><label>Retain weekly</label><input id="cfg_weekly" type="number" min="0" value="12"></div>
+    </div>
+    <div class="row">
+      <div><label>GUI key (empty = open)</label><input id="cfg_gui" type="password"></div>
+      <div><label>SMTP host</label><input id="cfg_smtp_host"></div>
+    </div>
+    <div class="row">
+      <div><label>SMTP user</label><input id="cfg_smtp_user"></div>
+      <div><label>SMTP password</label><input id="cfg_smtp_pass" type="password"></div>
+    </div>
+    <div class="row">
+      <div><label>SMTP port</label><input id="cfg_smtp_port" type="number" value="587"></div>
+      <div><label>Sender / recipients (comma-separated)</label><input id="cfg_smtp_to" placeholder="alerts@example.com, admin@example.com"></div>
+    </div>
+    <div class="row">
+      <div><label><input type="checkbox" id="cfg_email_on"> Email alerts on failure / corruption</label></div>
+      <div><label><input type="checkbox" id="cfg_tls" checked> Use STARTTLS</label></div>
+    </div>
+    <div class="actions">
+      <button class="btn-green" id="saveCfg">Save configuration</button>
+      <span style="flex:1"></span>
+      <button class="btn" id="newBackupFolder">Reset backup folder</button>
+    </div>
+    <div class="msg" id="cfgMsg"></div>
+  </div>
+  <div class="card">
+    <h2>Backups &amp; restore</h2>
+    <div id="tabs"></div>
+    <div class="actions">
+      <input type="file" id="restoreFile" accept=".json" style="flex:1">
+      <button class="btn-red" id="restoreBtn" disabled>Restore (wipes existing data)</button>
+    </div>
+    <div class="msg" id="restoreMsg"></div>
+  </div>
+</main>
+<div class="modal" id="restoreModal">
+  <div class="box">
+    <h2>Confirm restore</h2>
+    <p>Restoring <b id="rmName"></b> will <b>wipe all existing data</b> on the AutoBrain instance and replace it with this snapshot. Type <code>RESTORE</code> to confirm.</p>
+    <input type="text" id="rmConfirm" placeholder="RESTORE">
+    <div class="actions">
+      <button class="btn-red" id="rmYes" disabled>Restore now</button>
+      <button class="btn" id="rmNo">Cancel</button>
+    </div>
+  </div>
+</div>
+<script>
+const $=id=>document.getElementById(id), api={};
+let guiKey='';
+async function call(method,path,body){
+  const h={};
+  if(guiKey)h['X-Gui-Key']=guiKey;
+  if(body)h['Content-Type']='application/json';
+  const r=await fetch(path,{method,headers:h,body:body?JSON.stringify(body):undefined});
+  const t=await r.text();const d=t?JSON.parse(t):{};
+  if(!r.ok)throw new Error(d.error||('HTTP '+r.status));
+  return d;
+}
+function fmt(n){if(n==null)return'–';if(n>=1073741824)return(n/1073741824).toFixed(2)+' GiB';if(n>=1048576)return(n/1048576).toFixed(1)+' MiB';if(n>=1024)return(n/1024).toFixed(1)+' KiB';return n+' B'}
+function ua(s){if(!s)return null;try{return new Date(s).toLocaleString()}catch(e){return s}}
+function badge(s){if(s==='ok')return'<span class="badge ok">OK</span>';if(s==='fail')return'<span class="badge fail">FAIL</span>';return'<span class="badge none">never</span>'}
+function msg(el,text,cls){el.className='msg '+(cls||'ok');el.textContent=text}
+function loadCfg(c){
+  $('cfg_url').value=c.instance_url||'';$('cfg_key').value=c.api_key||'';
+  $('cfg_bk').value=c.backup_endpoint||'/admin-api/backup';$('cfg_rst').value=c.restore_endpoint||'/admin-api/restore';
+  $('cfg_int').value=c.schedule_interval||3600;$('cfg_ingest').value=c.ingest_key||'';
+  $('cfg_hourly').value=(c.retention&&c.retention.hourly)||24;$('cfg_daily').value=(c.retention&&c.retention.daily)||30;$('cfg_weekly').value=(c.retention&&c.retention.weekly)||12;
+  $('cfg_gui').value=c.gui_key||'';$('cfg_smtp_host').value=(c.email&&c.email.smtp_host)||'';$('cfg_smtp_user').value=(c.email&&c.email.smtp_user)||'';
+  $('cfg_smtp_pass').value=(c.email&&c.email.smtp_password)||'';$('cfg_smtp_port').value=(c.email&&c.email.smtp_port)||587;
+  $('cfg_smtp_to').value=(c.email&&c.email.to&&c.email.to.join(', '))||'';
+  $('cfg_email_on').checked=!!(c.email&&c.email.enabled);$('cfg_tls').checked=!(c.email&&c.email.use_tls===false);
+}
+function loadStatus(s){
+  $('health').innerHTML=[
+    ['Instance',s.instance||'not configured'],
+    ['Last backup',ua(s.last_backup_at)||'–'],
+    ['Last status',badge(s.last_status)+' '+(s.last_error||'').slice(0,60)],
+    ['Next run',ua(s.next_run_at)||'–'],
+    ['Counters',(s.counters.ok||0)+' ok / '+(s.counters.fail||0)+' fail'],
+    ['Retention',(s.retention.hourly+'h / '+s.retention.daily+'d / '+s.retention.weekly+'w')],
+    ['On disk',(s.backups.hourly+' hourly, '+s.backups.daily+' daily, '+s.backups.weekly+' weekly')],
+    ['Disk free',fmt(s.disk? s.disk.free:null)],
+  ].map(([k,v])=>`<div class="stat"><div class="k">${k}</div><div class="v">${v}</div></div>`).join('');
+}
+let tierData={};
+function loadBackups(b){
+  tierData=b;
+  $('tabs').innerHTML=['hourly','daily','weekly'].map(t=>{
+    const rows=(b[t]||[]).map(x=>`<tr><td>${x.name}</td><td>${fmt(x.size)}</td><td>${ua(x.mtime)}</td><td>
+      <a href="/api/backup/download?name=${encodeURIComponent(x.name)}" download>download</a> ·
+      <a href="#" data-restore="${x.name}">restore</a> · 
+      <a href="#" data-del="${x.name}" style="color:#e74c3c">delete</a></td></tr>`).join('');
+    return `<div style="margin-bottom:14px"><h3 style="margin:6px 0;color:#8a93a3;font-size:12px;text-transform:uppercase">${t}</h3>
+      ${rows?`<table><tr><th>file</th><th>size</th><th>created</th><th></th></tr>${rows}</table>`:'<small>no backups yet</small>'}</div>`;
+  }).join('');
+  document.querySelectorAll('[data-restore]').forEach(a=>a.onclick=ev=>{ev.preventDefault();openRestore(a.dataset.restore)});
+  document.querySelectorAll('[data-del]').forEach(a=>a.onclick=ev=>{ev.preventDefault();del(a.dataset.del)});
+}
+function openRestore(name){
+  $('rmName').textContent=name;$('rmConfirm').value='';$('rmYes').disabled=true;$('restoreModal').style.display='flex';
+}
+async function del(name){
+  if(!confirm('Delete '+name+'?'))return;
+  try{await call('DELETE','/api/backup/delete?name='+encodeURIComponent(name));await refresh();}
+  catch(e){msg($('restoreMsg'),e.message,'err')}
+}
+async function refresh(){
+  try{
+    const s=await call('GET','/api/status');loadStatus(s);
+    const c=await call('GET','/api/config');loadCfg(c);
+    const b=await call('GET','/api/backups');loadBackups(b);
+  }catch(e){msg($('cfgMsg'),'Connection failed: '+e.message,'err')}
+}
+async function unlock(){
+  try{
+    guiKey=$('gateKey').value;
+    await call('GET','/api/status');
+    $('gate').style.display='none';refresh();
+  }catch(e){$('gateErr').textContent=e.message;guiKey='';}
+}
+$('gateBtn').onclick=unlock;$('gateKey').onkeydown=e=>{if(e.key==='Enter')unlock()};
+$('saveCfg').onclick=async()=>{
+  const to=$('cfg_smtp_to').value.split(',').map(s=>s.trim()).filter(Boolean);
+  const cfg={
+    instance_url:$('cfg_url').value.trim(),api_key:$('cfg_key').value,
+    backup_endpoint:$('cfg_bk').value.trim(),restore_endpoint:$('cfg_rst').value.trim(),
+    schedule_interval:parseInt($('cfg_int').value)||3600,
+    ingest_key:$('cfg_ingest').value,gui_key:$('cfg_gui').value,
+    retention:{hourly:parseInt($('cfg_hourly').value)||0,daily:parseInt($('cfg_daily').value)||0,weekly:parseInt($('cfg_weekly').value)||0},
+    email:{enabled:$('cfg_email_on').checked,smtp_host:$('cfg_smtp_host').value.trim(),
+      smtp_port:parseInt($('cfg_smtp_port').value)||587,smtp_user:$('cfg_smtp_user').value.trim(),
+      smtp_password:$('cfg_smtp_pass').value,use_tls:$('cfg_tls').checked,
+      from:$('cfg_smtp_user').value.trim(),to:to}
+  };
+  try{await call('POST','/api/config',cfg);msg($('cfgMsg'),'Configuration saved.','ok');refresh();}
+  catch(e){msg($('cfgMsg'),e.message,'err')}
+};
+$('runNow').onclick=async()=>{
+  const b=$('runNow');b.disabled=true;b.textContent='Running…';
+  try{const r=await call('POST','/api/backup/run');msg($('cfgMsg'),r.ok?('Backup saved: '+r.name):('Failed: '+r.error),r.ok?'ok':'err');}
+  catch(e){msg($('cfgMsg'),e.message,'err')}
+  b.disabled=false;b.textContent='Run backup now';refresh();
+};
+$('restoreBtn').onclick=()=>{
+  const f=$('restoreFile').files[0];if(!f)return;
+  const rd=new FileReader();
+  rd.onload=async()=>{
+    openRestore(f.name+' (upload)');
+    $('rmUpload').value=rd.result.split(',')[1];
+  };
+  rd.readAsDataURL(f);
+};
+const up=document.createElement('input');up.type='hidden';up.id='rmUpload';
+$('restoreModal').querySelector('.box').appendChild(up);
+$('rmConfirm').oninput=e=>$('rmYes').disabled=e.target.value!=='RESTORE';
+$('rmNo').onclick=()=>$('restoreModal').style.display='none';
+$('rmYes').onclick=async()=>{
+  const n=$('rmName').textContent;
+  let body={confirm:true};
+  if($('rmUpload').value)body={confirm:true,content_b64:$('rmUpload').value,filename:n};
+  else body={confirm:true,name:n};
+  try{const r=await call('POST','/api/backup/restore',body);msg($('restoreMsg'),'Restore complete: '+r.restored,'ok');}
+  catch(e){msg($('restoreMsg'),e.message,'err')}
+  $('restoreModal').style.display='none';$('rmUpload').value='';
+};
+$('newBackupFolder').onclick=async()=>{
+  if(!confirm('Reset backup folder to /backups?'))return;
+  try{await call('POST','/api/config',{backup_dir:'/backups'});await refresh();}catch(e){}
+};
+fetch('/api/version').then(r=>r.json()).then(v=>$('version').textContent=v.version).catch(()=>{});
+if(location.protocol==='file:'||1){/* gate handled by unlock flow */}
+</script>
+</body>
+</html>

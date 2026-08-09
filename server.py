@@ -45,11 +45,13 @@ class App:
 
     # --- engine / paths ---
     def _instance_backup_dir(self, inst):
-        if self._backup_dir_override:
-            return Path(self._backup_dir_override) / inst["id"]
+        # an instance's explicit backup_dir wins; otherwise fall back to the
+        # CLI --backups override, then the config base folder, both + instance id
         explicit = (inst.get("backup_dir") or "").strip()
         if explicit:
             return Path(explicit)
+        if self._backup_dir_override:
+            return Path(self._backup_dir_override) / inst["id"]
         return Path(self.config.get().get("backup_dir") or "/backups") / inst["id"]
 
     def _engine(self, iid):

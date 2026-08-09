@@ -43,7 +43,7 @@ editable from the web GUI — no container rebuild or SSH editing needed.
 ```yaml
 services:
   autobrain-backup:
-    image: cannonfodder151/autobrain-backup:latest
+    image: ghcr.io/cannonfodder151/autobrain-backup:latest
     container_name: autobrain-backup
     restart: unless-stopped
     ports:
@@ -52,6 +52,11 @@ services:
       - /srv/autobrain-backup/config:/config     # config file lives here
       - /srv/autobrain-backup/data:/backups      # backup archives live here
 ```
+
+Images are published to GHCR (`ghcr.io/cannonfodder151/autobrain-backup`).
+A `cannonfodder151/autobrain-backup` Docker Hub image is published on every
+`v*` tag via GitHub Actions (Docker Hub publish is pending a refreshed
+Docker Hub token).
 
 Then open `http://<host>:8080`, enter the AutoBrain instance URL and its
 admin API key (`X-Admin-API-Key`), set SMTP settings for alerts, and hit

@@ -6,7 +6,7 @@ on:
     tags: ["v*"]
 
 env:
-  GHCR_IMAGE: ghcr.io/${{ github.repository }}
+  GHCR_IMAGE: ghcr.io/${{ github.repository_owner }}/autobrain-backup
   DH_IMAGE: cannonfodder151/autobrain-backup
 
 jobs:
@@ -32,13 +32,14 @@ jobs:
         id: meta
         shell: bash
         run: |
+          GHCR="${GHCR_IMAGE,,}"
           if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
             VER="${GITHUB_REF#refs/tags/}"
-            echo "ghcr_tags=$GHCR_IMAGE:${VER},$GHCR_IMAGE:latest" >> "$GITHUB_OUTPUT"
+            echo "ghcr_tags=${GHCR}:${VER},${GHCR}:latest" >> "$GITHUB_OUTPUT"
             echo "dh_tags=$DH_IMAGE:${VER},$DH_IMAGE:latest" >> "$GITHUB_OUTPUT"
           else
             SHA="${GITHUB_SHA::12}"
-            echo "ghcr_tags=$GHCR_IMAGE:latest,$GHCR_IMAGE:$SHA" >> "$GITHUB_OUTPUT"
+            echo "ghcr_tags=${GHCR}:latest,$GHCR:$SHA" >> "$GITHUB_OUTPUT"
             echo "dh_tags=" >> "$GITHUB_OUTPUT"
           fi
 

@@ -6,19 +6,22 @@ Simulates an AutoBrain instance with stdlib http.server and verifies:
   * instance CRUD (create / rename nickname / delete) + masked view
   * multi-instance backup (two instances, separate backup folders + state)
   * fetch + validation of a genuine backup (and rejection of a corrupt one)
-  * hourly/daily/weekly archive promotion + pruning
-  * restore (multipart upload) and its corruption gate
+  * fetch + validation of the MinIO image archive (same stamp)
+  * hourly/daily/weekly archive promotion + pruning (DB + images)
+  * restore (multipart upload) and its corruption gate (DB + images)
   * test-email success (fake SMTP) and failure (unreachable host)
   * HTTP API: login, instances list, create/save, single-instance fallback
 """
 
 import base64
 import http.client
+import io
 import json
 import shutil
 import socket
 import socketserver
 import sys
+import tarfile
 import tempfile
 import threading
 import urllib.error
@@ -41,6 +44,16 @@ def make_backup(created=None):
     }
 
 
+def make_assets():
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        data = b"\xff\xd8\xff fake-image"
+        info = tarfile.TarInfo("vehicles/v1/photo.jpg")
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
+
+
 class FakeInstance(BaseHTTPRequestHandler):
     received = {}
 
@@ -52,6 +65,13 @@ class FakeInstance(BaseHTTPRequestHandler):
             body = json.dumps(make_backup()).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == "/api/v1/admin-api/assets/backup":
+            body = make_assets()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/gzip")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -180,7 +200,9 @@ def test_multi_instance(tmp, base_url):
     assert sa["nickname"] == "One" and sb["nickname"] == "Two"
     assert sa["counters"]["ok"] == 1 and sb["counters"]["ok"] == 1
     assert sa["backup_dir"] != sb["backup_dir"]
-    print("ok: two instances back up into separate folders with separate state")
+    assert sa["assets"]["counts"]["hourly"] == 1 and sa["assets"]["last_assets_error"] is None
+    assert list((tmp / "backups" / a["id"] / "hourly" / "images").glob("autobrain-assets-*.tar.gz")), "image archive missing"
+    print("ok: two instances back up into separate folders with separate state (db + images)")
 
 
 def test_validation():
@@ -211,10 +233,16 @@ def test_retention(tmp, base_url, cfg):
     eng.instance = cfg.get_instance(a["id"])
     for i in range(4):
         eng._save_body(json.dumps(make_backup(created=f"2026-08-0{i+1}T00:00:00+00:00")).encode())
+        eng._save_assets(make_assets(), f"2026-08-0{i+1}T000000")
     eng.rotate()
     hourly_count = len(list((bdir / "hourly").glob("autobrain-backup-*.json")))
+    hourly_img = len(list((bdir / "hourly" / "images").glob("autobrain-assets-*.tar.gz")))
     assert hourly_count <= 3, f"hourly prune failed: {hourly_count}"
-    print("ok: daily/weekly promotion + hourly prune (kept", hourly_count, ")")
+    assert hourly_img <= 3, f"hourly image prune failed: {hourly_img}"
+    daily_img = list((bdir / "daily" / "images").glob("autobrain-assets-daily-*.tar.gz"))
+    weekly_img = list((bdir / "weekly" / "images").glob("autobrain-assets-weekly-*.tar.gz"))
+    assert daily_img and weekly_img, "image promotion missing"
+    print("ok: daily/weekly promotion + prune (db kept", hourly_count, ", images kept", hourly_img, ")")
 
 
 def test_restore(tmp, base_url, cfg):
@@ -233,6 +261,85 @@ def test_restore(tmp, base_url, cfg):
         pass
     eng.restore(name, confirm=True)
     print("ok: restore multipart upload + corruption gate")
+
+
+def test_assets_roundtrip(tmp, base_url, cfg):
+    FakeInstance.received = {}
+    a = cfg.get_instance("inst_default") or cfg.add_instance({"instance_url": base_url, "api_key": "k"})
+    eng = engine_for(cfg, a["id"], tmp, base_url)
+    name = eng.run_backup()
+    stamp = name[len("autobrain-backup-"):-len(".json")]
+    img_name = f"autobrain-assets-{stamp}.tar.gz"
+    img_path = tmp / "backups" / a["id"] / "hourly" / "images" / img_name
+    assert img_path.exists(), "image archive not saved alongside DB snapshot"
+
+    try:
+        BackupEngine.validate_assets(b"not a tar.gz")
+        raise AssertionError("corrupt image archive accepted")
+    except BackupError:
+        pass
+
+    status, restored = eng.restore_assets({"content_b64": base64.b64encode(make_assets()).decode(), "filename": "x.tar.gz"}, confirm=True)
+    assert status == 200 and restored.startswith("autobrain-assets-"), (status, restored)
+    assert FakeInstance.received.get("/api/v1/admin-api/assets/restore"), "image restore never reached the instance"
+    assert b"----autobrainbackup" in FakeInstance.received["/api/v1/admin-api/assets/restore"], "not a multipart body"
+
+    try:
+        eng.restore_assets({"content_b64": base64.b64encode(b"corrupt").decode(), "filename": "x.tar.gz"}, confirm=True)
+        raise AssertionError("corrupt image restore accepted")
+    except BackupError:
+        pass
+
+    try:
+        eng.restore_assets(img_name, confirm=False)
+        raise AssertionError("image restore without confirm accepted")
+    except BackupError:
+        pass
+
+    status, restored = eng.restore_assets(img_name, confirm=True)
+    assert status == 200 and restored == img_name, (status, restored)
+    assert FakeInstance.received.get("/api/v1/admin-api/assets/restore"), "stored image restore never reached the instance"
+
+    listing = eng.list_backups()
+    assert listing["images"]["hourly"] and listing["images"]["hourly"][0]["name"] == img_name
+    print("ok: image archive fetch/save/rotate/restore round-trip")
+
+
+def test_api_assets(tmp, base_url):
+    import server
+
+    cfg_path = tmp / "apicfg.json"
+    app = server.App(str(cfg_path), tmp / "backups")
+    inst = app.config.add_instance({"nickname": "T", "instance_url": base_url, "api_key": "k"})
+    iid = inst["id"]
+    srv = server.BackupServer(("127.0.0.1", 0), app)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = "http://127.0.0.1:%d" % srv.server_address[1]
+    try:
+        app._engine(iid).run_backup()
+        with urllib.request.urlopen(base + f"/api/backups?instance={iid}", timeout=5) as r:
+            d = json.loads(r.read())
+        img = d["images"]["hourly"][0]["name"]
+        dbname = d["hourly"][0]["name"]
+        with urllib.request.urlopen(base + f"/api/assets/download?instance={iid}&name={img}", timeout=5) as r:
+            assert r.status == 200 and r.read()[:2] == b"\x1f\x8b"
+        c = http.client.HTTPConnection("127.0.0.1", srv.server_address[1], timeout=5)
+        payload = json.dumps({"name": img, "confirm": False})
+        c.request("POST", f"/api/assets/restore?instance={iid}", body=payload, headers={"Content-Type": "application/json"})
+        r = c.getresponse(); r.read()
+        assert r.status == 400, "restore without confirm accepted"
+        payload = json.dumps({"name": img, "confirm": True})
+        c.request("POST", f"/api/assets/restore?instance={iid}", body=payload, headers={"Content-Type": "application/json"})
+        r = c.getresponse(); d = json.loads(r.read() or b"{}")
+        assert r.status == 200 and d["ok"] is True, (r.status, d)
+        assert FakeInstance.received.get("/api/v1/admin-api/assets/restore"), "restore never reached the instance"
+        c.request("POST", f"/api/backup/restore?instance={iid}", body=json.dumps({"name": dbname, "confirm": True}), headers={"Content-Type": "application/json"})
+        r = c.getresponse(); d = json.loads(r.read() or b"{}")
+        assert r.status == 200 and d["ok"] is True, (r.status, d)
+        print("ok: HTTP assets download + confirm-gated restore (and stored DB restore)")
+    finally:
+        srv.shutdown()
+        app.stop()
 
 
 def test_email(tmp):
@@ -347,6 +454,8 @@ def main():
         cfg.add_instance({"id": "inst_default", "instance_url": base_url, "api_key": "k"})
         test_retention(tmp, base_url, cfg)
         test_restore(tmp, base_url, cfg)
+        test_assets_roundtrip(tmp, base_url, cfg)
+        test_api_assets(tmp, base_url)
         srv.shutdown()
         test_email(tmp)
         test_api(tmp)

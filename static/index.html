@@ -95,6 +95,10 @@ small{color:var(--muted)}
       <div><label>Restore endpoint</label><input id="cfg_rst" value="/api/v1/admin-api/restore"></div>
     </div>
     <div class="row">
+      <div><label>Assets backup endpoint</label><input id="cfg_abk" value="/api/v1/admin-api/assets/backup"></div>
+      <div><label>Assets restore endpoint</label><input id="cfg_arst" value="/api/v1/admin-api/assets/restore"></div>
+    </div>
+    <div class="row">
       <div><label>Schedule interval (seconds)</label><input id="cfg_int" type="number" min="60" value="3600"></div>
       <div><label><input type="checkbox" id="cfg_enabled" checked> Instance enabled (scheduled backups)</label></div>
     </div>
@@ -153,7 +157,7 @@ small{color:var(--muted)}
 <div class="modal" id="restoreModal">
   <div class="box">
     <h2>Confirm restore</h2>
-    <p>Restoring <b id="rmName"></b> will <b>wipe all existing data</b> on the AutoBrain instance and replace it with this snapshot. Type <code>RESTORE</code> to confirm.</p>
+    <p id="rmDesc">Restoring <b id="rmName"></b> will <b>wipe all existing data</b> on the AutoBrain instance and replace it with this snapshot. Type <code>RESTORE</code> to confirm.</p>
     <input type="text" id="rmConfirm" placeholder="RESTORE">
     <div class="actions">
       <button class="btn-red" id="rmYes" disabled>Restore now</button>
@@ -182,6 +186,7 @@ function loadCfg(c){
   const inst=c.instance||{};
   $('cfg_nick').value=inst.nickname||'';$('cfg_url').value=inst.instance_url||'';$('cfg_key').value=inst.api_key||'';
   $('cfg_bk').value=inst.backup_endpoint||'/api/v1/admin-api/backup';$('cfg_rst').value=inst.restore_endpoint||'/api/v1/admin-api/restore';
+  $('cfg_abk').value=inst.assets_backup_endpoint||'/api/v1/admin-api/assets/backup';$('cfg_arst').value=inst.assets_restore_endpoint||'/api/v1/admin-api/assets/restore';
   $('cfg_int').value=inst.schedule_interval||3600;$('cfg_ingest').value=inst.ingest_key||'';
   $('cfg_enabled').checked=inst.enabled!==false;
   $('cfg_hourly').value=(inst.retention&&inst.retention.hourly)||24;$('cfg_daily').value=(inst.retention&&inst.retention.daily)||30;$('cfg_weekly').value=(inst.retention&&inst.retention.weekly)||12;
@@ -200,6 +205,8 @@ function loadStatus(s){
     ['Counters',(s.counters.ok||0)+' ok / '+(s.counters.fail||0)+' fail'],
     ['Retention',(s.retention.hourly+'h / '+s.retention.daily+'d / '+s.retention.weekly+'w')],
     ['On disk',(s.backups.hourly+' hourly, '+s.backups.daily+' daily, '+s.backups.weekly+' weekly')],
+    ['Images',(s.assets&&s.assets.counts?(s.assets.counts.hourly+'h / '+s.assets.counts.daily+'d / '+s.assets.counts.weekly+'w'):'–')],
+    ['Image status',(s.assets&&s.assets.last_assets_error)?('⚠ '+esc(s.assets.last_assets_error).slice(0,50)):((s.assets&&s.assets.last_assets_at)?'ok':'–')],
     ['Disk free',fmt(s.disk? s.disk.free:null)],
   ].map(([k,v])=>`<div class="stat"><div class="k">${k}</div><div class="v">${v}</div></div>`).join('');
 }
@@ -211,11 +218,39 @@ function loadBackups(b){
       <a href="/api/backup/download?instance=${encodeURIComponent(cur)}&name=${encodeURIComponent(x.name)}" download>download</a> ·
       <a href="#" data-restore="${esc(x.name)}">restore</a> ·
       <a href="#" data-del="${esc(x.name)}" style="color:#e74c3c">delete</a></td></tr>`).join('');
-    return `<div style="margin-bottom:14px"><h3 style="margin:6px 0;color:#8a93a3;font-size:12px;text-transform:uppercase">${t}</h3>
-      ${rows?`<table><tr><th>file</th><th>size</th><th>created</th><th></th></tr>${rows}</table>`:'<small>no backups yet</small>'}</div>`;
+    const imgs=(b.images&&b.images[t]||[]).map(x=>`<tr><td>${esc(x.name)}</td><td>${fmt(x.size)}</td><td>${ua(x.mtime)}</td><td>
+      <a href="/api/assets/download?instance=${encodeURIComponent(cur)}&name=${encodeURIComponent(x.name)}" download>download</a> ·
+      <a href="#" data-restore-assets="${esc(x.name)}">restore</a> ·
+      <a href="#" data-del-assets="${esc(x.name)}" style="color:#e74c3c">delete</a></td></tr>`).join('');
+    return `<div style="margin-bottom:14px"><h3 style="margin:6px 0;color:#8a93a3;font-size:12px;text-transform:uppercase">${t} · database</h3>
+      ${rows?`<table><tr><th>file</th><th>size</th><th>created</th><th></th></tr>${rows}</table>`:'<small>no backups yet</small>'}
+      <h3 style="margin:10px 0 6px;color:#8a93a3;font-size:12px;text-transform:uppercase">${t} · images</h3>
+      ${imgs?`<table><tr><th>archive</th><th>size</th><th>created</th><th></th></tr>${imgs}</table>`:'<small>no image archives yet</small>'}</div>`;
   }).join('');
   document.querySelectorAll('[data-restore]').forEach(a=>a.onclick=ev=>{ev.preventDefault();openRestore(a.dataset.restore)});
   document.querySelectorAll('[data-del]').forEach(a=>a.onclick=ev=>{ev.preventDefault();del(a.dataset.del)});
+  document.querySelectorAll('[data-restore-assets]').forEach(a=>a.onclick=ev=>{ev.preventDefault();openRestoreAssets(a.dataset.restoreAssets)});
+  document.querySelectorAll('[data-del-assets]').forEach(a=>a.onclick=ev=>{ev.preventDefault();delAssets(a.dataset.delAssets)});
+}
+function openRestore(name){
+  $('rmKind').value='db';
+  $('rmName').textContent=name;$('rmConfirm').value='';$('rmYes').disabled=true;$('restoreModal').style.display='flex';
+  $('rmDesc').innerHTML=`Restoring <b>${esc(name)}</b> will <b>wipe all existing data</b> on the instance and replace it with this snapshot. Type <code>RESTORE</code> to confirm.`;
+}
+function openRestoreAssets(name){
+  $('rmKind').value='assets';
+  $('rmName').textContent=name;$('rmConfirm').value='';$('rmYes').disabled=true;$('restoreModal').style.display='flex';
+  $('rmDesc').innerHTML=`Restoring <b>${esc(name)}</b> will <b>wipe all existing images</b> on the instance and replace them with this archive. Type <code>RESTORE</code> to confirm.`;
+}
+async function del(name){
+  if(!confirm('Delete '+name+'?'))return;
+  try{await call('DELETE','/api/backup/delete?instance='+encodeURIComponent(cur)+'&name='+encodeURIComponent(name));await loadDetail();}
+  catch(e){msg($('restoreMsg'),e.message,'err')}
+}
+async function delAssets(name){
+  if(!confirm('Delete image archive '+name+'?'))return;
+  try{await call('DELETE','/api/assets/delete?instance='+encodeURIComponent(cur)+'&name='+encodeURIComponent(name));await loadDetail();}
+  catch(e){msg($('restoreMsg'),e.message,'err')}
 }
 function renderInstances(){
   const el=$('instList');
@@ -317,6 +352,7 @@ $('saveCfg').onclick=async()=>{
     instance_id:cur,
     nickname:$('cfg_nick').value.trim(),instance_url:$('cfg_url').value.trim(),api_key:$('cfg_key').value,
     backup_endpoint:$('cfg_bk').value.trim(),restore_endpoint:$('cfg_rst').value.trim(),
+    assets_backup_endpoint:$('cfg_abk').value.trim(),assets_restore_endpoint:$('cfg_arst').value.trim(),
     schedule_interval:parseInt($('cfg_int').value)||3600,enabled:$('cfg_enabled').checked,
     ingest_key:$('cfg_ingest').value,
     retention:{hourly:parseInt($('cfg_hourly').value)||0,daily:parseInt($('cfg_daily').value)||0,weekly:parseInt($('cfg_weekly').value)||0},
@@ -351,15 +387,18 @@ $('restoreBtn').onclick=()=>{
   rd.readAsDataURL(f);
 };
 const up=document.createElement('input');up.type='hidden';up.id='rmUpload';
+const rk=document.createElement('input');rk.type='hidden';rk.id='rmKind';rk.value='db';
 $('restoreModal').querySelector('.box').appendChild(up);
+$('restoreModal').querySelector('.box').appendChild(rk);
 $('rmConfirm').oninput=e=>$('rmYes').disabled=e.target.value!=='RESTORE';
 $('rmNo').onclick=()=>$('restoreModal').style.display='none';
 $('rmYes').onclick=async()=>{
   const n=$('rmName').textContent;
+  const isAssets=$('rmKind').value==='assets';
   let body={confirm:true};
-  if($('rmUpload').value)body={confirm:true,content_b64:$('rmUpload').value,filename:n};
+  if(!isAssets&&$('rmUpload').value)body={confirm:true,content_b64:$('rmUpload').value,filename:n};
   else body={confirm:true,name:n};
-  try{const r=await call('POST','/api/backup/restore?instance='+encodeURIComponent(cur),body);msg($('restoreMsg'),'Restore complete: '+r.restored,'ok');}
+  try{const r=await call('POST',(isAssets?'/api/assets/restore':'/api/backup/restore')+'?instance='+encodeURIComponent(cur),body);msg($('restoreMsg'),'Restore complete: '+r.restored,'ok');}
   catch(e){msg($('restoreMsg'),e.message,'err')}
   $('restoreModal').style.display='none';$('rmUpload').value='';
 };

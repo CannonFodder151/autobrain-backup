@@ -3,14 +3,15 @@
 A web-interface backup tool for **one or more AutoBrain instances**. The main
 page lists every backup instance (each with an optional nickname); you add an
 AutoBrain instance, it downloads a full database snapshot on a schedule
-(hourly by default), combines snapshots into hourly/daily/weekly retention
-tiers, provides a one-click restore, shows stats and health per instance in a
-web GUI, and emails alerts when a backup job fails or a corrupt backup is
+(hourly by default) plus a gzipped tar archive of the instance's MinIO image
+assets, combines both into hourly/daily/weekly retention tiers, provides a
+one-click restore for either, shows stats and health per instance in a web
+GUI, and emails alerts when a backup job fails or a corrupt backup is
 detected. A **test email** button verifies the SMTP alert config.
 
 Deterministic and stdlib-only — no AI, no external services. Backups are full
 database snapshots (validated as genuine AutoBrain backups before anything is
-saved or restored).
+saved or restored) and image archives (validated as readable gzip tars).
 
 ## What it does
 
@@ -19,25 +20,29 @@ saved or restored).
    folder (`{backup_dir}/{instance_id}`). Instances can be added, renamed,
    deleted and paused from the GUI.
 2. **Backup** — every `schedule_interval` seconds (default 3600) fetches
-   `GET {instance_url}/api/v1/admin-api/backup` with `X-Admin-API-Key`.
-3. **Validation** — every payload must be a real AutoBrain backup
-   (`app=autobrain`, `kind=backup`, non-empty `data`). Invalid payloads are
+   `GET {instance_url}/api/v1/admin-api/backup` with `X-Admin-API-Key`, and
+   the image archive `GET {instance_url}/api/v1/admin-api/assets/backup`
+   (a tar.gz of every object in the instance's MinIO bucket, same run stamp).
+3. **Validation** — the DB payload must be a real AutoBrain backup
+   (`app=autobrain`, `kind=backup`, non-empty `data`); the image archive must
+   be a readable gzip tar with safe member names. Invalid payloads are
    rejected, counted as failures, and an alert email is sent.
 4. **Retention tiers** — snapshots are combined into
    `hourly/` (one per run, keep N), `daily/` (one per day, keep N) and
-   `weekly/` (one per week, keep N). Since backups are full snapshots,
-   "combining" means promoting the newest snapshot up a tier and pruning old
-   ones to the configured limits.
-5. **Restore** — pick a stored backup (or upload one) in the GUI; the service
-   re-validates it, then POSTs it to `{instance_url}/api/v1/admin-api/restore`
-   as a multipart upload. Restoring wipes existing data on the instance — the
-   GUI requires typing `RESTORE` to confirm.
+   `weekly/` (one per week, keep N). Image archives follow the same stamp into
+   a per-tier `images/` folder with the same promotion + pruning.
+5. **Restore** — pick a stored backup or image archive (or upload one) in the
+   GUI; the service re-validates it, then POSTs it to the instance's
+   `/api/v1/admin-api/restore` (DB) or `/api/v1/admin-api/assets/restore`
+   (images) as a multipart upload. Restoring wipes existing data on the
+   instance — the GUI requires typing `RESTORE` to confirm for both.
 6. **Alerts** — SMTP email on backup job failure and on detected corruption.
    The SMTP settings mirror the AutoBrain app (host, port, TLS, user,
    password, from-address). A **Test email** button sends a test alert and
    reports success or the exact error.
-7. **Stats & health** — the GUI shows last backup, status, error, next run,
-   counters, retention counts, and disk usage per instance.
+7. **Stats & health** — the GUI shows last backup, last image archive,
+   status, error, next run, counters, retention counts, and disk usage per
+   instance.
 
 An `autobrain-backup-agent` (see the `autobrain-backup-agent` repo) can push
 snapshots in instead of the service pulling: it POSTs the backup file to the
@@ -104,10 +109,13 @@ interval. Press **Run backup now** to trigger one immediately.
 | `POST /api/config` | save instance + email/gui settings |
 | `POST /api/email/test` | send a test alert email; reports success/failure |
 | `POST /api/backup/run?instance=<id>` | trigger a backup now |
-| `GET /api/backups?instance=<id>` | list hourly/daily/weekly backups |
-| `GET /api/backup/download?instance=<id>&name=…` | download a stored backup |
-| `POST /api/backup/restore?instance=<id>` | restore (body `{name|content_b64, confirm:true}`) |
-| `DELETE /api/backup/delete?instance=<id>&name=…` | delete a stored backup |
+| `GET /api/backups?instance=<id>` | list hourly/daily/weekly backups + image archives |
+| `GET /api/backup/download?instance=<id>&name=…` | download a stored DB backup |
+| `POST /api/backup/restore?instance=<id>` | restore DB (body `{name\|content_b64, confirm:true}`) |
+| `DELETE /api/backup/delete?instance=<id>&name=…` | delete a stored DB backup |
+| `GET /api/assets/download?instance=<id>&name=…` | download a stored image archive |
+| `POST /api/assets/restore?instance=<id>` | restore images (body `{name\|content_b64, confirm:true}`) |
+| `DELETE /api/assets/delete?instance=<id>&name=…` | delete a stored image archive |
 | `POST /ingest?instance=<id>` | receive a backup pushed by autobrain-backup-agent |
 
 With exactly one instance configured, the `?instance=` parameter is optional
@@ -143,6 +151,8 @@ single-instance config is migrated automatically into an instance entry.
       "api_key": "",
       "backup_endpoint": "/api/v1/admin-api/backup",
       "restore_endpoint": "/api/v1/admin-api/restore",
+      "assets_backup_endpoint": "/api/v1/admin-api/assets/backup",
+      "assets_restore_endpoint": "/api/v1/admin-api/assets/restore",
       "schedule_interval": 3600,
       "ingest_key": "",
       "retention": {"hourly": 24, "daily": 30, "weekly": 12},
@@ -158,9 +168,14 @@ the instance's `backup_dir`), with its run state in `state.json` alongside.
 
 ## Prerequisite
 
-`GET /api/v1/admin-api/backup` and `POST /api/v1/admin-api/restore` must be
-enabled on the AutoBrain instance (they are available since backend `2.x`;
-both require `ADMIN_API_KEY` to be set on the instance).
+`GET /api/v1/admin-api/backup`, `POST /api/v1/admin-api/restore`,
+`GET /api/v1/admin-api/assets/backup` and
+`POST /api/v1/admin-api/assets/restore` must be enabled on the AutoBrain
+instance (DB backup/restore available since backend `2.x`; the assets
+endpoints since backend `3.x`; all require `ADMIN_API_KEY` to be set). Image
+backup needs MinIO configured (default in the docker-compose stack). If the
+backend predates the assets endpoints, the DB snapshot still backs up; the
+image archive is skipped and shown as an image status warning.
 
 ## Test
 

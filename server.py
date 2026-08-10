@@ -27,7 +27,7 @@ from pathlib import Path
 from engine import BackupEngine, BackupError, Config, Mailer, State
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
-VERSION = "2.0.2"
+VERSION = "3.0.0"
 
 SESSION_TTL = 24 * 3600
 
@@ -315,6 +315,10 @@ class Handler(BaseHTTPRequestHandler):
             if not self._authorized():
                 return self._unauthorized()
             return self._download()
+        if path == "/api/assets/download":
+            if not self._authorized():
+                return self._unauthorized()
+            return self._download_assets()
         if path == "/api/version":
             return self._send(200, {"version": VERSION, "app": "autobrain-backup"})
         self._send(404, {"error": "not found"})
@@ -352,6 +356,10 @@ class Handler(BaseHTTPRequestHandler):
             if not self._authorized():
                 return self._unauthorized()
             return self._restore()
+        if path == "/api/assets/restore":
+            if not self._authorized():
+                return self._unauthorized()
+            return self._restore_assets()
         if path == "/ingest":
             return self._ingest()
         self._send(404, {"error": "not found"})
@@ -450,7 +458,8 @@ class Handler(BaseHTTPRequestHandler):
         iid = str(payload.pop("instance_id", "") or "") or self._instance_id()
         inst_fields = {}
         for k in ("nickname", "instance_url", "api_key", "backup_endpoint",
-                  "restore_endpoint", "schedule_interval", "ingest_key",
+                  "restore_endpoint", "assets_backup_endpoint",
+                  "assets_restore_endpoint", "schedule_interval", "ingest_key",
                   "retention", "enabled"):
             if k in payload:
                 inst_fields[k] = payload.pop(k)
@@ -530,6 +539,49 @@ class Handler(BaseHTTPRequestHandler):
         eng.alert_restore(status, name)
         return self._send(200, {"ok": True, "restored": name, "http": status})
 
+    def _download_assets(self):
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        name = (qs.get("name") or [""])[0]
+        iid = self._instance_id()
+        if not iid:
+            return self._send(400, {"error": "instance required"})
+        if not name or "/" in name or "\\" in name or name.startswith("."):
+            return self._send(400, {"error": "invalid image archive name"})
+        eng = self._engine(iid)
+        if eng is None:
+            return
+        try:
+            path = eng._resolve_assets_source(name)
+        except BackupError as e:
+            return self._send(404, {"error": str(e)})
+        body = path.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/gzip")
+        self.send_header("Content-Disposition", f'attachment; filename="{path.name}"')
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _restore_assets(self):
+        iid = self._need_instance()
+        if iid is None:
+            return
+        try:
+            payload = self._read_json()
+        except (json.JSONDecodeError, ValueError):
+            return self._send(400, {"error": "invalid JSON"})
+        confirm = bool(payload.get("confirm"))
+        if not confirm:
+            return self._send(400, {"error": "confirm=true is required (image restore wipes existing images)"})
+        eng = self._engine(iid)
+        if eng is None:
+            return
+        try:
+            status, name = eng.restore_assets(payload, confirm=True)
+        except BackupError as e:
+            return self._send(400, {"error": str(e)})
+        return self._send(200, {"ok": True, "restored": name, "http": status})
+
     def _ingest(self):
         """Receives a backup pushed by the autobrain-backup-agent."""
         iid = self._need_instance()
@@ -577,6 +629,23 @@ class Handler(BaseHTTPRequestHandler):
                     p.unlink()
                     return self._send(200, {"ok": True, "deleted": name})
             return self._send(404, {"error": "backup not found"})
+        if path == "/api/assets/delete" and self._authorized():
+            iid = self._need_instance()
+            if iid is None:
+                return
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            name = (qs.get("name") or [""])[0]
+            if not name or "/" in name or "\\" in name or name.startswith("."):
+                return self._send(400, {"error": "invalid image archive name"})
+            eng = self._engine(iid)
+            if eng is None:
+                return
+            for d in (eng._hourly_dir(), eng._daily_dir(), eng._weekly_dir()):
+                p = d / "images" / name
+                if p.exists():
+                    p.unlink()
+                    return self._send(200, {"ok": True, "deleted": name})
+            return self._send(404, {"error": "image archive not found"})
         self._send(404, {"error": "not found"})
 
 

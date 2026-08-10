@@ -13,10 +13,11 @@ instance has its own nickname, admin credentials, retention, schedule and
 backup folder (``{backup_dir}/{instance_id}`` by default). Run state for each
 instance lives in ``{backup_dir}/{instance_id}/state.json``.
 
-Backups are full database snapshots, so "combine" means retention tiers:
-the hourly tier keeps the most recent snapshots, the daily tier keeps one
-per day, and the weekly tier keeps one per week. Older tiers prune to the
-configured limits.
+Backups are full database snapshots plus a gzipped tar archive of the
+instance's MinIO image assets (same stamp, stored under per-tier `images/`),
+so "combine" means retention tiers: the hourly tier keeps the most recent
+snapshots, the daily tier keeps one per day, and the weekly tier keeps one
+per week. Older tiers prune to the configured limits.
 """
 
 import copy
@@ -65,6 +66,8 @@ DEFAULT_INSTANCE = {
     "api_key": "",
     "backup_endpoint": "/api/v1/admin-api/backup",
     "restore_endpoint": "/api/v1/admin-api/restore",
+    "assets_backup_endpoint": "/api/v1/admin-api/assets/backup",
+    "assets_restore_endpoint": "/api/v1/admin-api/assets/restore",
     "schedule_interval": 3600,
     "ingest_key": "",
     "retention": {"hourly": 24, "daily": 30, "weekly": 12},
@@ -73,7 +76,7 @@ DEFAULT_INSTANCE = {
 }
 
 MASKED_KEYS = {"api_key", "gui_key", "gui_password", "ingest_key", "smtp_password"}
-_HDRS = {"Accept": "application/json", "User-Agent": "autobrain-backup/2.0"}
+_HDRS = {"Accept": "application/json", "User-Agent": "autobrain-backup/3.0.0"}
 
 
 class BackupError(Exception):
@@ -223,7 +226,10 @@ class Config:
         out["api_key"] = str(inst.get("api_key") or "")
         out["backup_endpoint"] = str(inst.get("backup_endpoint") or DEFAULT_INSTANCE["backup_endpoint"]).strip()
         out["restore_endpoint"] = str(inst.get("restore_endpoint") or DEFAULT_INSTANCE["restore_endpoint"]).strip()
-        for e in ("backup_endpoint", "restore_endpoint"):
+        out["assets_backup_endpoint"] = str(inst.get("assets_backup_endpoint") or DEFAULT_INSTANCE["assets_backup_endpoint"]).strip()
+        out["assets_restore_endpoint"] = str(inst.get("assets_restore_endpoint") or DEFAULT_INSTANCE["assets_restore_endpoint"]).strip()
+        for e in ("backup_endpoint", "restore_endpoint",
+                  "assets_backup_endpoint", "assets_restore_endpoint"):
             if not out[e].startswith("/"):
                 out[e] = "/" + out[e]
         try:
@@ -343,7 +349,8 @@ class State:
     """Persistent per-instance run state: last run, health, archive cursors."""
 
     FIELDS = {"last_run", "last_status", "last_error", "last_backup_at",
-              "next_run_at", "last_daily_date", "last_weekly_date", "counters"}
+              "next_run_at", "last_daily_date", "last_weekly_date", "counters",
+              "last_assets_at", "last_assets_error"}
 
     def __init__(self, path):
         self.path = Path(path)
@@ -428,6 +435,24 @@ class BackupEngine:
             raise BackupError("backup missing data section")
         return data
 
+    @staticmethod
+    def validate_assets(body):
+        """Ensure the payload really is a gzipped tar of image objects."""
+        import io
+        import tarfile
+
+        if not body or body[:2] != b"\x1f\x8b":
+            raise BackupError("asset archive is not a gzip tar")
+        try:
+            with tarfile.open(fileobj=io.BytesIO(body), mode="r:gz") as tar:
+                names = tar.getnames()
+        except (tarfile.TarError, EOFError, OSError) as e:
+            raise BackupError(f"invalid image archive: {e}") from e
+        for name in names:
+            if name.startswith("/") or ".." in name.split("/"):
+                raise BackupError("image archive contains an unsafe member name")
+        return names
+
     # --- storage ---
     def _path(self, *parts):
         p = self.backup_dir.joinpath(*parts)
@@ -470,6 +495,28 @@ class BackupEngine:
             raise
         return dest, data
 
+    def _save_assets(self, body, stamp):
+        """Validate and store an image archive under hourly/images/."""
+        self.validate_assets(body)
+        images = self._hourly_dir() / "images"
+        images.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=".assets-", suffix=".tar.gz", dir=images)
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(body)
+            name = f"autobrain-assets-{stamp}.tar.gz"
+            dest = images / name
+            if dest.exists():
+                dest.unlink()
+            shutil.move(tmp, dest)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        return dest
+
     def run_backup(self):
         """Fetch, validate, save and rotate. Returns the saved backup name."""
         url = str(self._cfg("instance_url") or "").rstrip("/")
@@ -481,9 +528,22 @@ class BackupEngine:
             endpoint = "/" + endpoint
         body, _ct = self._fetch(url + endpoint, key)
         path, data = self._save_body(body)
+        stamp = path.stem[len("autobrain-backup-"):]
+        assets_error = None
+        assets_at = None
+        try:
+            aep = str(self._cfg("assets_backup_endpoint") or "/api/v1/admin-api/assets/backup")
+            if not aep.startswith("/"):
+                aep = "/" + aep
+            abody, _ct = self._fetch(url + aep, key)
+            self._save_assets(abody, stamp)
+            assets_at = _utcnow().isoformat()
+        except BackupError as e:
+            assets_error = str(e)
         self.rotate()
         self.state.update(last_run=_utcnow().isoformat(), last_status="ok",
-                          last_error=None, last_backup_at=path.name)
+                          last_error=None, last_backup_at=path.name,
+                          last_assets_at=assets_at, last_assets_error=assets_error)
         self.state.touch_counters(ok=True)
         return path.name
 
@@ -519,6 +579,12 @@ class BackupEngine:
                 src = newest[0]
                 day_name = f"autobrain-backup-daily-{today}.json"
                 shutil.copy2(src, daily / day_name)
+            newest_img = sorted((hourly / "images").glob("autobrain-assets-*.tar.gz"))[-1:]
+            if newest_img:
+                aimg = daily / "images"
+                aimg.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(newest_img[0], aimg / f"autobrain-assets-daily-{today}.tar.gz")
+            if newest or newest_img:
                 self.state.update(last_daily_date=today)
 
         if st.get("last_weekly_date") != week:
@@ -529,11 +595,22 @@ class BackupEngine:
                 src = newest[0]
                 week_name = f"autobrain-backup-weekly-{week}.json"
                 shutil.copy2(src, weekly / week_name)
+            newest_img = sorted((daily / "images").glob("autobrain-assets-daily-*.tar.gz"))[-1:]
+            if not newest_img:
+                newest_img = sorted((hourly / "images").glob("autobrain-assets-*.tar.gz"))[-1:]
+            if newest_img:
+                aimg = weekly / "images"
+                aimg.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(newest_img[0], aimg / f"autobrain-assets-weekly-{week}.tar.gz")
+            if newest or newest_img:
                 self.state.update(last_weekly_date=week)
 
         self._prune(hourly, "autobrain-backup-*.json", int(ret.get("hourly", 24)))
         self._prune(daily, "autobrain-backup-daily-*.json", int(ret.get("daily", 30)))
         self._prune(weekly, "autobrain-backup-weekly-*.json", int(ret.get("weekly", 12)))
+        self._prune(hourly / "images", "autobrain-assets-*.tar.gz", int(ret.get("hourly", 24)))
+        self._prune(daily / "images", "autobrain-assets-daily-*.tar.gz", int(ret.get("daily", 30)))
+        self._prune(weekly / "images", "autobrain-assets-weekly-*.tar.gz", int(ret.get("weekly", 12)))
 
     @staticmethod
     def _prune(directory, pattern, keep):
@@ -587,13 +664,15 @@ class BackupEngine:
 
     def _resolve_source(self, source):
         """Resolve a stored backup name or upload filename to a concrete file."""
-        if isinstance(source, dict):  # upload: {"filename": str, "content_b64": str}
-            body = __import__("base64").b64decode(source.get("content_b64", ""))
-            data = self.validate(body)
-            name = f"autobrain-backup-{re.sub(r'[^0-9]', '', data.get('created_at') or _stamp())[:14]}.json"
-            path = self._hourly_dir() / name
-            path.write_bytes(body)
-            return path
+        if isinstance(source, dict):  # {"name": str} or upload {"filename", "content_b64"}
+            if source.get("content_b64"):
+                body = __import__("base64").b64decode(source.get("content_b64", ""))
+                data = self.validate(body)
+                name = f"autobrain-backup-{re.sub(r'[^0-9]', '', data.get('created_at') or _stamp())[:14]}.json"
+                path = self._hourly_dir() / name
+                path.write_bytes(body)
+                return path
+            source = source.get("name")
         name = str(source)
         if name.startswith(".") or "/" in name or "\\" in name:
             raise BackupError("invalid backup name")
@@ -603,8 +682,66 @@ class BackupEngine:
                 return p
         raise BackupError("backup not found")
 
+    def _resolve_assets_source(self, source):
+        """Resolve a stored image archive name or upload dict to a concrete file."""
+        if isinstance(source, dict):  # {"name": str} or upload {"filename", "content_b64"}
+            if source.get("content_b64"):
+                body = __import__("base64").b64decode(source.get("content_b64", ""))
+                self.validate_assets(body)
+                name = f"autobrain-assets-{_stamp()}.tar.gz"
+                path = self._hourly_dir() / "images" / name
+                path.write_bytes(body)
+                return path
+            source = source.get("name")
+        name = str(source)
+        if name.startswith(".") or "/" in name or "\\" in name:
+            raise BackupError("invalid image archive name")
+        for d in (self._hourly_dir(), self._daily_dir(), self._weekly_dir()):
+            p = d / "images" / name
+            if p.exists():
+                return p
+        raise BackupError("image archive not found")
+
+    def restore_assets(self, source, confirm=False):
+        """Push a stored image archive back to the instance. Wipes existing images."""
+        if not confirm:
+            raise BackupError("restore requires confirm=true")
+        url = str(self._cfg("instance_url") or "").rstrip("/")
+        key = self._cfg("api_key") or ""
+        if not url or not key:
+            raise BackupError("instance_url and api_key are required in config")
+        path = self._resolve_assets_source(source)
+        body = path.read_bytes()
+        self.validate_assets(body)  # corruption gate before we wipe anything
+        endpoint = str(self._cfg("assets_restore_endpoint") or "/api/v1/admin-api/assets/restore")
+        if not endpoint.startswith("/"):
+            endpoint = "/" + endpoint
+        boundary = "----autobrainbackup"
+        payload = (
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="file"; filename="restore.tar.gz"\r\n'
+            "Content-Type: application/gzip\r\n\r\n"
+        ).encode("utf-8") + body + f"\r\n--{boundary}--\r\n".encode("utf-8")
+        req = urllib.request.Request(
+            url + endpoint,
+            data=payload,
+            method="POST",
+            headers=dict(_HDRS, **{
+                HEADER_KEY: key,
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+            }),
+        )
+        try:
+            with self._opener().open(req, timeout=600) as r:
+                r.read()
+                return r.status, path.name
+        except urllib.error.HTTPError as e:
+            raise BackupError(f"image restore failed: server returned HTTP {e.code}") from e
+        except urllib.error.URLError as e:
+            raise BackupError(f"image restore failed: cannot reach {url}: {e.reason}") from e
+
     def list_backups(self):
-        out = {"hourly": [], "daily": [], "weekly": []}
+        out = {"hourly": [], "daily": [], "weekly": [], "images": {"hourly": [], "daily": [], "weekly": []}}
         for tier, pattern in (("hourly", "autobrain-backup-*.json"),
                               ("daily", "autobrain-backup-daily-*.json"),
                               ("weekly", "autobrain-backup-weekly-*.json")):
@@ -616,6 +753,17 @@ class BackupEngine:
                     except OSError:
                         mtime = None
                     out[tier].append({"name": p.name, "size": p.stat().st_size, "mtime": mtime})
+        for tier, pattern in (("hourly", "autobrain-assets-*.tar.gz"),
+                              ("daily", "autobrain-assets-daily-*.tar.gz"),
+                              ("weekly", "autobrain-assets-weekly-*.tar.gz")):
+            d = self._path(tier) / "images"
+            if d.exists():
+                for p in sorted(d.glob(pattern), reverse=True):
+                    try:
+                        mtime = datetime.fromtimestamp(p.stat().st_mtime, timezone.utc).isoformat()
+                    except OSError:
+                        mtime = None
+                    out["images"][tier].append({"name": p.name, "size": p.stat().st_size, "mtime": mtime})
         return out
 
     def status(self):
@@ -637,6 +785,11 @@ class BackupEngine:
             "last_backup_at": st.get("last_backup_at"),
             "next_run_at": st.get("next_run_at"),
             "counters": st.get("counters", {}),
+            "assets": {
+                "last_assets_at": st.get("last_assets_at"),
+                "last_assets_error": st.get("last_assets_error"),
+                "counts": {t: len(v) for t, v in self.list_backups().get("images", {}).items()},
+            },
             "backup_dir": str(self.backup_dir),
             "disk": None if disk is None else {
                 "total": disk.total, "used": disk.used, "free": disk.free,

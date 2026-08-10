@@ -8,14 +8,16 @@
 `autobrain-backup` is the off-box backup service for AutoBrain. It is
 **multi-tenant**: the main page lists every AutoBrain instance being backed
 up (each with an optional nickname). For each instance it downloads a full
-database snapshot every hour (with the admin API key), combines snapshots
-into hourly/daily/weekly retention tiers, restores on demand, emails alerts
-on job failure and corruption, and surfaces per-instance stats/health in a
-web GUI. A **Test email** button verifies the SMTP alert config. Config
-lives in a file on the docker host and is edited from the GUI.
+database snapshot every hour (with the admin API key) plus a gzipped tar
+archive of the instance's MinIO image assets, combines both into
+hourly/daily/weekly retention tiers, restores either on demand, emails
+alerts on job failure and corruption, and surfaces per-instance
+stats/health in a web GUI. A **Test email** button verifies the SMTP alert
+config. Config lives in a file on the docker host and is edited from the
+GUI.
 
 Public repo: https://github.com/CannonFodder151/autobrain-backup
-Public image: `ghcr.io/cannonfodder151/autobrain-backup` (`:latest`, `:2.0.0`)
+Public image: `ghcr.io/cannonfodder151/autobrain-backup` (`:latest`, `:3.0.0`)
 
 ## How it works
 
@@ -23,19 +25,22 @@ Public image: `ghcr.io/cannonfodder151/autobrain-backup` (`:latest`, `:2.0.0`)
    a nickname, admin key, retention, schedule and its own backup folder
    (`{backup_dir}/{instance_id}`). Add / rename / delete / pause from the GUI.
 2. Every `schedule_interval` seconds (default 3600) the service fetches
-   `GET {instance_url}/api/v1/admin-api/backup` with `X-Admin-API-Key`.
-3. The payload is validated before saving: it must be a genuine AutoBrain
-   backup (`app=autobrain`, `kind=backup`, non-empty `data`). Anything else
-   is rejected, counted as a failure, and triggers an alert email.
+   `GET {instance_url}/api/v1/admin-api/backup` with `X-Admin-API-Key`, plus
+   the image archive `GET {instance_url}/api/v1/admin-api/assets/backup` (a
+   tar.gz of every object in the instance's MinIO bucket, same run stamp).
+3. The payload is validated before saving: the DB snapshot must be a genuine
+   AutoBrain backup (`app=autobrain`, `kind=backup`, non-empty `data`); the
+   image archive must be a readable gzip tar with safe member names. Anything
+   else is rejected, counted as a failure, and triggers an alert email.
 4. Snapshots are stored under `hourly/`, promoted to `daily/` once per day
    and `weekly/` once per week, then pruned to the configured retention
-   (defaults: 24 hourly, 30 daily, 12 weekly). Because backups are full
-   snapshots, "combining" means promoting the newest snapshot up a tier and
-   pruning old ones.
-5. Restore: pick a stored backup (or upload one) in the GUI. The service
-   re-validates it, then POSTs it to `{instance_url}/api/v1/admin-api/restore`
-   as a multipart upload. Restore wipes existing data — the GUI requires
-   typing `RESTORE` to confirm.
+   (defaults: 24 hourly, 30 daily, 12 weekly). Image archives follow the same
+   stamp into a per-tier `images/` folder with identical promotion + pruning.
+5. Restore: pick a stored backup or image archive (or upload one) in the GUI.
+   The service re-validates it, then POSTs it to the instance's
+   `/api/v1/admin-api/restore` (DB) or `/api/v1/admin-api/assets/restore`
+   (images) as a multipart upload. Restore wipes existing data — the GUI
+   requires typing `RESTORE` to confirm for both.
 6. Alerts are sent via SMTP (STARTTLS) on job failure, on detected
    corruption, and after a completed restore. SMTP settings mirror the
    AutoBrain app (host, port, TLS, user, password, from-address). A
@@ -82,10 +87,14 @@ The hosted AutoBrain production instance is backed up by the same service:
 
 The AutoBrain instance must have `ADMIN_API_KEY` set (see
 `docker-compose.hosted.yml` — `ADMIN_API_KEY: ${ADMIN_API_KEY:-}`) and must
-run backend code that includes the `GET /admin-api/backup` and
-`POST /admin-api/restore` endpoints (mounted under the API v1 prefix, i.e.
+run backend code that includes `GET /admin-api/backup` and
+`POST /admin-api/restore` (mounted under the API v1 prefix, i.e.
 `/api/v1/admin-api/backup`, added in backend commit `4dac8893`, AutoBrain
-repo). These endpoints are also used by `autobrain-backup-agent`.
+repo) plus `GET /admin-api/assets/backup` and `POST /admin-api/assets/restore`
+(since backend `3.x`, for MinIO image assets). The assets endpoints need
+MinIO configured (default in the docker-compose stack). Instances on an older
+backend still back up their DB; image archives are skipped with a status
+warning. These endpoints are also used by `autobrain-backup-agent`.
 
 ## Configuration
 
@@ -109,6 +118,8 @@ Per-instance settings:
 | `api_key` | Admin API key (`X-Admin-API-Key`) |
 | `backup_endpoint` | default `/api/v1/admin-api/backup` |
 | `restore_endpoint` | default `/api/v1/admin-api/restore` |
+| `assets_backup_endpoint` | default `/api/v1/admin-api/assets/backup` |
+| `assets_restore_endpoint` | default `/api/v1/admin-api/assets/restore` |
 | `schedule_interval` | seconds between runs, default 3600 |
 | `retention.hourly/daily/weekly` | tier sizes, defaults 24/30/12 |
 | `ingest_key` | optional key for the agent `/ingest` push |
@@ -146,16 +157,23 @@ runs as non-root.
 `GET /api/backups?instance=<id>`,
 `GET /api/backup/download?instance=<id>&name=…`,
 `POST /api/backup/restore?instance=<id>`,
-`DELETE /api/backup/delete?instance=<id>&name=…`, `POST /ingest?instance=<id>`.
+`DELETE /api/backup/delete?instance=<id>&name=…`,
+`GET /api/assets/download?instance=<id>&name=…`,
+`POST /api/assets/restore?instance=<id>`,
+`DELETE /api/assets/delete?instance=<id>&name=…`, `POST /ingest?instance=<id>`.
 With one instance configured, the `?instance=` parameter is optional.
 
 ## Status
 
+- v3.0.0: image (MinIO) backup + restore. DB snapshot and image archive
+  fetched together, stored under per-tier `images/`, listed/downloaded/
+  restored via GUI + API, restore validated + `RESTORE`-confirmed. All
+  engine + API checks green.
 - v2.0.0: multi-tenant (instances list + nicknames), per-instance folders +
   state, hosted instance wired in, SMTP alerts mirror the AutoBrain app,
-  test-email button. All engine + API checks green.
+  test-email button.
 - v1.1.0: username/password login GUI.
 - v1.0.0: initial single-instance service; GHCR + Docker Hub images publish
   on `v*` tags via GitHub Actions.
-- Backend endpoints merged to AutoBrain `main` (commit `4dac8893`); instances
+- Backend assets endpoints merged to AutoBrain `main` (PR #20); instances
   need a redeploy + `ADMIN_API_KEY` to expose them.

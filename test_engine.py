@@ -32,6 +32,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from engine import BackupEngine, BackupError, Config, Mailer, State  # noqa: E402
+import server  # noqa: E402
 
 
 def make_backup(created=None):
@@ -441,11 +442,41 @@ def test_api(tmp):
         app.stop()
 
 
+def test_scheduler_due(tmp):
+    cfg_path = tmp / "sched.json"
+    cfg_path.write_text(json.dumps({
+        "backup_dir": "/backups",
+        "email": {"enabled": False},
+        "instances": [{
+            "id": "inst_default", "nickname": "sched",
+            "instance_url": "", "api_key": "k",
+            "schedule_interval": 3600, "enabled": True,
+        }],
+    }))
+    data_dir = tmp / "sched-data"
+    state_dir = data_dir / "inst_default"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "state.json").write_text(json.dumps({
+        "last_run": "2020-01-01T00:00:00+00:00",
+    }))
+    app = server.App(str(cfg_path), str(data_dir))
+    try:
+        inst = app.config.instances()[0]
+        app._scheduler_step(inst)
+        st = app._engine("inst_default").state.get()
+        assert st.get("next_run_at"), st
+        assert st["next_run_at"].startswith("2020-01-01T01:00:00"), st
+    finally:
+        app.stop()
+    print("ok: scheduler computes next_run_at from last_run (regression: datetime + int)")
+
+
 def main():
     tmp = Path(tempfile.mkdtemp(prefix="abtest-"))
     try:
         test_migration(tmp)
         test_instance_crud(Config(tmp / "crud.json"))
+        test_scheduler_due(tmp)
         srv = start_fake()
         base_url = f"http://127.0.0.1:{srv.server_port}"
         test_multi_instance(tmp, base_url)

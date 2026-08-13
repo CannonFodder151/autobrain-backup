@@ -20,7 +20,7 @@ import sys
 import threading
 import time
 import urllib.parse
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -154,10 +154,8 @@ class App:
                 last = None
         now = datetime.now(timezone.utc)
         due = last is None or (now - last).total_seconds() >= interval
-        if last is None:
-            next_run = now + interval
-        else:
-            next_run = last + interval
+        delta = timedelta(seconds=interval)
+        next_run = (last if last is not None else now) + delta
         eng.state.update(next_run_at=next_run.isoformat())
         if due and not inst.get("instance_url"):
             return

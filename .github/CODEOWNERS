@@ -1,0 +1,2 @@
+# Workflow/CI changes require explicit review (AUT-826 security boundary).
+.github/workflows/ @CannonFodder151

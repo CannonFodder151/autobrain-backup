@@ -27,9 +27,13 @@ from pathlib import Path
 from engine import BackupEngine, BackupError, Config, Mailer, State
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
-VERSION = "3.0.0"
+VERSION = "3.0.2"
 
 SESSION_TTL = 24 * 3600
+
+# Consecutive failed attempts before the scheduler stops retrying and alerts;
+# a single transient failure self-heals on the next 60s tick (AUT-1023).
+_CONSECUTIVE_FAIL_ALERT = 3
 
 
 class App:
@@ -157,18 +161,29 @@ class App:
         delta = timedelta(seconds=interval)
         next_run = (last if last is not None else now) + delta
         eng.state.update(next_run_at=next_run.isoformat())
-        if due and not inst.get("instance_url"):
+        if not due or not inst.get("instance_url"):
             return
-        if due:
-            try:
-                eng.run_backup()
-            except BackupError as e:
-                eng.state.update(last_status="fail", last_error=str(e), last_run=_utcnow_iso())
-                eng.state.touch_counters(ok=False)
+        fails = int(st.get("consecutive_failures") or 0)
+        try:
+            eng.run_backup()
+        except BackupError as e:
+            # Transient blips (deploy churn, DB restart, timeout) must not
+            # consume last_run: leaving it stale lets the next 60s tick retry
+            # instead of waiting a full interval. Alert only after repeated
+            # failures so a one-off blip doesn't spam admins.
+            eng.state.update(last_status="fail", last_error=str(e),
+                             consecutive_failures=fails + 1)
+            eng.state.touch_counters(ok=False)
+            if fails + 1 >= _CONSECUTIVE_FAIL_ALERT:
+                eng.state.update(last_run=_utcnow_iso())
                 eng.alert_failure(e)
-            except Exception as e:  # defensive: never kill the scheduler
-                eng.state.update(last_status="fail", last_error=f"unexpected: {e}", last_run=_utcnow_iso())
-                eng.state.touch_counters(ok=False)
+        except Exception as e:  # defensive: never kill the scheduler
+            msg = f"unexpected: {e}"
+            eng.state.update(last_status="fail", last_error=msg,
+                             consecutive_failures=fails + 1)
+            eng.state.touch_counters(ok=False)
+            if fails + 1 >= _CONSECUTIVE_FAIL_ALERT:
+                eng.state.update(last_run=_utcnow_iso())
 
     def run_backup_now(self, iid):
         try:

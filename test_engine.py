@@ -471,12 +471,157 @@ def test_scheduler_due(tmp):
     print("ok: scheduler computes next_run_at from last_run (regression: datetime + int)")
 
 
+class FlakyInstance(BaseHTTPRequestHandler):
+    """Serves 500 to the backup endpoint for the first `fail_first` requests,
+    then behaves like the real instance (so a transient blip can be simulated)."""
+
+    fail_first = 2
+    hits = {}
+
+    def log_message(self, *a):
+        pass
+
+    def _respond(self, code, body):
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        key = self.path
+        n = self.hits.get(key, 0) + 1
+        self.hits[key] = n
+        if self.path == "/api/v1/admin-api/backup":
+            if n <= self.fail_first:
+                return self._respond(500, json.dumps({"detail": "boom"}).encode())
+            body = json.dumps(make_backup()).encode()
+            return self._respond(200, body)
+        if self.path == "/api/v1/admin-api/assets/backup":
+            body = make_assets()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/gzip")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self._respond(404, b"{}")
+
+
+def start_flaky(fail_first=2):
+    FlakyInstance.fail_first = fail_first
+    FlakyInstance.hits = {}
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), FlakyInstance)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+def _write_sched_cfg(cfg_path, base_url, email=None):
+    cfg_path.write_text(json.dumps({
+        "backup_dir": "/backups",
+        "email": email or {"enabled": False},
+        "instances": [{
+            "id": "inst_default", "nickname": "flaky",
+            "instance_url": base_url, "api_key": "k",
+            "schedule_interval": 3600, "enabled": True,
+        }],
+    }))
+
+
+def _make_app_with_inert_scheduler(cfg_path, data_dir):
+    """Construct an App whose background scheduler thread is inert so tests can
+    drive _scheduler_step() deterministically (no startup-tick race)."""
+    orig = server.App._scheduler
+    server.App._scheduler = lambda self: self._sched_stop.wait()  # park until stop()
+    try:
+        app = server.App(str(cfg_path), str(data_dir))
+    finally:
+        server.App._scheduler = orig
+    return app
+
+
+def test_scheduler_transient_retry(tmp):
+    """A transient failure must NOT consume last_run: the next tick retries
+    and the run recovers with status ok and no alert (AUT-1023)."""
+    srv = start_flaky(fail_first=2)
+    base_url = f"http://127.0.0.1:{srv.server_port}"
+    cfg_path = tmp / "flaky.json"
+    _write_sched_cfg(cfg_path, base_url)
+    data_dir = tmp / "flaky-data"
+    state_dir = data_dir / "inst_default"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "state.json").write_text(json.dumps({
+        "last_run": "2020-01-01T00:00:00+00:00",
+    }))
+    app = _make_app_with_inert_scheduler(cfg_path, data_dir)
+    try:
+        inst = app.config.instances()[0]
+        eng = app._engine(inst["id"])
+        app._scheduler_step(inst)                     # tick 1: 500
+        st = eng.state.get()
+        assert st["last_status"] == "fail", st
+        assert st["consecutive_failures"] == 1, st
+        assert st["last_run"] == "2020-01-01T00:00:00+00:00", st  # preserved
+        assert st["last_error"] == "server returned HTTP 500 for " + base_url + "/api/v1/admin-api/backup", st["last_error"]
+        app._scheduler_step(inst)                     # tick 2: 500
+        st = eng.state.get()
+        assert st["consecutive_failures"] == 2 and st["last_run"] == "2020-01-01T00:00:00+00:00", st
+        app._scheduler_step(inst)                     # tick 3: 200 -> recovers
+        st = eng.state.get()
+        assert st["last_status"] == "ok", st
+        assert st["consecutive_failures"] == 0, st
+        assert st["last_run"] != "2020-01-01T00:00:00+00:00", st
+        assert st["counters"]["fail"] == 2 and st["counters"]["ok"] == 1, st["counters"]
+    finally:
+        app.stop()
+        srv.shutdown()
+    print("ok: transient failure retries (tick-by-tick), recovers with status ok, no alert")
+
+
+def test_scheduler_alerts_after_consecutive_failures(tmp):
+    """Persistent failures alert only after the threshold, then back off."""
+    smtp = start_smtp()
+    srv = start_flaky(fail_first=999)
+    base_url = f"http://127.0.0.1:{srv.server_port}"
+    email = {"enabled": True, "smtp_host": "127.0.0.1", "smtp_port": smtp.server_address[1],
+             "smtp_user": "", "use_tls": False, "from": "noreply@ab.app", "to": ["ops@ab.app"]}
+    cfg_path = tmp / "flaky2.json"
+    _write_sched_cfg(cfg_path, base_url, email)
+    data_dir = tmp / "flaky2-data"
+    state_dir = data_dir / "inst_default"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "state.json").write_text(json.dumps({
+        "last_run": "2020-01-01T00:00:00+00:00",
+    }))
+    app = _make_app_with_inert_scheduler(cfg_path, data_dir)
+    try:
+        inst = app.config.instances()[0]
+        eng = app._engine(inst["id"])
+        app._scheduler_step(inst)
+        app._scheduler_step(inst)
+        assert eng.state.get()["consecutive_failures"] == 2
+        assert not FakeSMTP.inbox, "alert sent too early"
+        app._scheduler_step(inst)                     # 3rd consecutive failure
+        st = eng.state.get()
+        assert st["consecutive_failures"] == 3, st
+        assert st["last_run"] != "2020-01-01T00:00:00+00:00", st  # backs off a full interval
+        assert len(FakeSMTP.inbox) == 1, "alert email not sent"
+        assert b"job failed" in FakeSMTP.inbox[0].lower(), FakeSMTP.inbox[0]
+    finally:
+        app.stop()
+        srv.shutdown()
+        smtp.shutdown()
+    print("ok: persistent failure alerts once at threshold, then backs off")
+
+
 def main():
     tmp = Path(tempfile.mkdtemp(prefix="abtest-"))
     try:
         test_migration(tmp)
         test_instance_crud(Config(tmp / "crud.json"))
         test_scheduler_due(tmp)
+        test_scheduler_transient_retry(tmp)
+        test_scheduler_alerts_after_consecutive_failures(tmp)
         srv = start_fake()
         base_url = f"http://127.0.0.1:{srv.server_port}"
         test_multi_instance(tmp, base_url)

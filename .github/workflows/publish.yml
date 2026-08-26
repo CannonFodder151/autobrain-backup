@@ -12,7 +12,9 @@ env:
 jobs:
   build-and-push:
     if: github.event_name != 'pull_request'
-    runs-on: [self-hosted, linux, x64]
+    # AUT-1661: Moved from self-hosted (offline) to GitHub-hosted.
+    # Docker buildx + GHA cache works fine on ubuntu-latest.
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write

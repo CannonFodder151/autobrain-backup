@@ -350,7 +350,8 @@ class State:
 
     FIELDS = {"last_run", "last_status", "last_error", "last_backup_at",
               "next_run_at", "last_attempt_at", "last_daily_date", "last_weekly_date",
-              "counters", "last_assets_at", "last_assets_error", "consecutive_failures"}
+              "counters", "last_assets_at", "last_assets_error", "consecutive_failures",
+              "alerted_at"}
 
     def __init__(self, path):
         self.path = Path(path)
@@ -545,7 +546,7 @@ class BackupEngine:
                           last_error=None, last_backup_at=path.name,
                           last_attempt_at=_utcnow().isoformat(),
                           last_assets_at=assets_at, last_assets_error=assets_error,
-                          consecutive_failures=0)
+                          consecutive_failures=0, alerted_at=None)
         self.state.touch_counters(ok=True)
         return path.name
 
@@ -559,7 +560,7 @@ class BackupEngine:
         self.state.update(last_run=_utcnow().isoformat(), last_status="ok",
                           last_error=None, last_backup_at=path.name,
                           last_attempt_at=_utcnow().isoformat(),
-                          consecutive_failures=0)
+                          consecutive_failures=0, alerted_at=None)
         self.state.touch_counters(ok=True)
         return path.name
 

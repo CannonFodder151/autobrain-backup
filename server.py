@@ -192,16 +192,22 @@ class App:
         except BackupError as e:
             # Transient blips (deploy churn, DB restart, timeout) must not
             # consume last_run: leaving it stale lets the next 60s tick retry
-            # instead of waiting a full interval. Alert only after repeated
-            # failures so a one-off blip doesn't spam admins.
+            # instead of waiting a full interval. Alert exactly once when the
+            # failure streak first crosses the threshold — firing on every
+            # subsequent attempt (fails+1 >= N) would re-email admins every
+            # _RETRY_SECONDS tick and re-spam Discord forever (AUT-2310).
+            new_fails = fails + 1
             eng.state.update(last_status="fail", last_error=str(e),
-                             consecutive_failures=fails + 1,
+                             consecutive_failures=new_fails,
                              last_attempt_at=now.isoformat())
             eng.state.touch_counters(ok=False)
-            if fails + 1 >= _CONSECUTIVE_FAIL_ALERT:
+            if new_fails >= _CONSECUTIVE_FAIL_ALERT and not st.get("alerted_at"):
                 # Back off: stamp last_run so next tick waits the full interval
-                # instead of hammering a genuinely-down host every 60s.
-                eng.state.update(last_run=now.isoformat())
+                # instead of hammering a genuinely-down host every 60s
+                # (AUT-2370). Stamp alerted_at so the next failure cycle must
+                # accumulate _CONSECUTIVE_FAIL_ALERT new failures before
+                # another email is sent (AUT-2310).
+                eng.state.update(last_run=now.isoformat(), alerted_at=now.isoformat())
                 eng.alert_failure(e)
                 # Reset counter after alerting so the next failure cycle
                 # must accumulate _CONSECUTIVE_FAIL_ALERT new failures
@@ -210,12 +216,13 @@ class App:
                 eng.state.update(consecutive_failures=0)
         except Exception as e:  # defensive: never kill the scheduler
             msg = f"unexpected: {e}"
+            new_fails = fails + 1
             eng.state.update(last_status="fail", last_error=msg,
-                             consecutive_failures=fails + 1,
+                             consecutive_failures=new_fails,
                              last_attempt_at=now.isoformat())
             eng.state.touch_counters(ok=False)
-            if fails + 1 >= _CONSECUTIVE_FAIL_ALERT:
-                eng.state.update(last_run=now.isoformat())
+            if new_fails >= _CONSECUTIVE_FAIL_ALERT and not st.get("alerted_at"):
+                eng.state.update(last_run=now.isoformat(), alerted_at=now.isoformat())
                 eng.alert_failure(e)
                 eng.state.update(consecutive_failures=0)
 

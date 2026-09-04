@@ -579,7 +579,13 @@ def test_scheduler_transient_retry(tmp):
 
 
 def test_scheduler_alerts_after_consecutive_failures(tmp):
-    """Persistent failures alert only after the threshold, then back off."""
+    """Persistent failures alert only after the threshold, then back off + reset.
+
+    AUT-2370 regression: after the threshold alert fires, the consecutive
+    counter must reset to 0. Previously the counter stayed at 3+ forever,
+    so every subsequent tick that hit the threshold again immediately
+    re-sent the alert (host stays down → inbox flooded every interval).
+    """
     smtp = start_smtp()
     srv = start_flaky(fail_first=999)
     base_url = f"http://127.0.0.1:{srv.server_port}"
@@ -603,15 +609,66 @@ def test_scheduler_alerts_after_consecutive_failures(tmp):
         assert not FakeSMTP.inbox, "alert sent too early"
         app._scheduler_step(inst)                     # 3rd consecutive failure
         st = eng.state.get()
-        assert st["consecutive_failures"] == 3, st
+        assert st["consecutive_failures"] == 0, st  # AUT-2370: reset after alert
         assert st["last_run"] != "2020-01-01T00:00:00+00:00", st  # backs off a full interval
         assert len(FakeSMTP.inbox) == 1, "alert email not sent"
         assert b"job failed" in FakeSMTP.inbox[0].lower(), FakeSMTP.inbox[0]
+
+        # Force the scheduler back into "due" state and fail again — counter
+        # must start from 0 so the next alert requires 3 *new* failures,
+        # not the stale value from the prior cycle.
+        eng.state.update(last_run="2020-01-01T00:00:00+00:00")
+        app._scheduler_step(inst)
+        app._scheduler_step(inst)
+        assert eng.state.get()["consecutive_failures"] == 2
+        assert len(FakeSMTP.inbox) == 1, "alert re-fired prematurely (AUT-2370)"
     finally:
         app.stop()
         srv.shutdown()
         smtp.shutdown()
-    print("ok: persistent failure alerts once at threshold, then backs off")
+    print("ok: persistent failure alerts once at threshold, resets counter after alert")
+
+def test_run_backup_now_3strike_threshold(tmp):
+    """Manual Run Now must apply the same 3-strike threshold as the scheduler.
+
+    AUT-2370 regression: clicking "Run Now" used to email the admin on every
+    single transient failure (no threshold), spamming the inbox whenever an
+    admin clicked during a brief deploy churn.
+    """
+    smtp = start_smtp()
+    srv = start_flaky(fail_first=999)
+    base_url = f"http://127.0.0.1:{srv.server_port}"
+    email = {"enabled": True, "smtp_host": "127.0.0.1", "smtp_port": smtp.server_address[1],
+             "smtp_user": "", "use_tls": False, "from": "noreply@ab.app", "to": ["ops@ab.app"]}
+    cfg_path = tmp / "runnow.json"
+    _write_sched_cfg(cfg_path, base_url, email)
+    data_dir = tmp / "runnow-data"
+    app = _make_app_with_inert_scheduler(cfg_path, data_dir)
+    try:
+        inst = app.config.instances()[0]
+        iid = inst["id"]
+
+        r1 = app.run_backup_now(iid)
+        r2 = app.run_backup_now(iid)
+        assert r1["ok"] is False and r2["ok"] is False
+        assert not FakeSMTP.inbox, "Run Now alerted on transient failure (AUT-2370)"
+
+        # Third consecutive failure crosses the threshold and emails.
+        r3 = app.run_backup_now(iid)
+        assert r3["ok"] is False
+        assert len(FakeSMTP.inbox) == 1
+        assert b"job failed" in FakeSMTP.inbox[0].lower()
+
+        # Counter resets after alert — next two failures should be silent.
+        r4 = app.run_backup_now(iid)
+        r5 = app.run_backup_now(iid)
+        assert r4["ok"] is False and r5["ok"] is False
+        assert len(FakeSMTP.inbox) == 1, "Run Now re-alerted before threshold (AUT-2370)"
+    finally:
+        app.stop()
+        srv.shutdown()
+        smtp.shutdown()
+    print("ok: run_backup_now applies 3-strike threshold + resets counter after alert")
 
 
 def main():
@@ -622,6 +679,7 @@ def main():
         test_scheduler_due(tmp)
         test_scheduler_transient_retry(tmp)
         test_scheduler_alerts_after_consecutive_failures(tmp)
+        test_run_backup_now_3strike_threshold(tmp)
         srv = start_fake()
         base_url = f"http://127.0.0.1:{srv.server_port}"
         test_multi_instance(tmp, base_url)

@@ -27,7 +27,7 @@ from pathlib import Path
 from engine import BackupEngine, BackupError, Config, Mailer, State
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
-VERSION = "3.0.2"
+VERSION = "3.0.3"
 
 SESSION_TTL = 24 * 3600
 
@@ -166,6 +166,9 @@ class App:
         fails = int(st.get("consecutive_failures") or 0)
         try:
             eng.run_backup()
+            # Success: reset consecutive counter so a later transient blip
+            # doesn't immediately re-trigger an alert (AUT-2285/AUT-2370).
+            eng.state.update(consecutive_failures=0)
         except BackupError as e:
             # Transient blips (deploy churn, DB restart, timeout) must not
             # consume last_run: leaving it stale lets the next 60s tick retry
@@ -175,8 +178,15 @@ class App:
                              consecutive_failures=fails + 1)
             eng.state.touch_counters(ok=False)
             if fails + 1 >= _CONSECUTIVE_FAIL_ALERT:
+                # Back off: stamp last_run so next tick waits the full interval
+                # instead of hammering a genuinely-down host every 60s.
                 eng.state.update(last_run=_utcnow_iso())
                 eng.alert_failure(e)
+                # Reset counter after alerting so the next failure cycle
+                # must accumulate _CONSECUTIVE_FAIL_ALERT new failures
+                # before another email is sent (fixes persistent email spam
+                # when host stays down: AUT-2370).
+                eng.state.update(consecutive_failures=0)
         except Exception as e:  # defensive: never kill the scheduler
             msg = f"unexpected: {e}"
             eng.state.update(last_status="fail", last_error=msg,
@@ -184,17 +194,29 @@ class App:
             eng.state.touch_counters(ok=False)
             if fails + 1 >= _CONSECUTIVE_FAIL_ALERT:
                 eng.state.update(last_run=_utcnow_iso())
+                eng.alert_failure(e)
+                eng.state.update(consecutive_failures=0)
 
     def run_backup_now(self, iid):
+        eng = self._engine(iid)
+        fails = int(eng.state.get().get("consecutive_failures") or 0)
         try:
-            name = self._engine(iid).run_backup()
+            name = eng.run_backup()
+            # Success: reset the 3-strike counter (AUT-2370).
+            eng.state.update(consecutive_failures=0)
             return {"ok": True, "name": name}
         except BackupError as e:
-            eng = self._engine(iid)
-            eng.state.update(last_status="fail", last_error=str(e), last_run=_utcnow_iso())
+            eng.state.update(last_status="fail", last_error=str(e), last_run=_utcnow_iso(),
+                             consecutive_failures=fails + 1)
             eng.state.touch_counters(ok=False)
-            eng.alert_failure(e)
-            eng.alert_corruption(e) if "corrupt" in str(e).lower() else None
+            # Same 3-strike threshold as the scheduler (AUT-2370): a manual
+            # click shouldn't email the admin on every transient blip —
+            # wait for repeated failures or an explicit corruption signal.
+            if fails + 1 >= _CONSECUTIVE_FAIL_ALERT:
+                eng.alert_failure(e)
+                eng.state.update(consecutive_failures=0)
+            if "corrupt" in str(e).lower():
+                eng.alert_corruption(e)
             return {"ok": False, "error": str(e)}
 
     def test_email(self):

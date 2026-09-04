@@ -27,7 +27,7 @@ from pathlib import Path
 from engine import BackupEngine, BackupError, Config, Mailer, State
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
-VERSION = "3.0.3"
+VERSION = "3.0.4"
 
 SESSION_TTL = 24 * 3600
 
@@ -206,14 +206,12 @@ class App:
                 # instead of hammering a genuinely-down host every 60s
                 # (AUT-2370). Stamp alerted_at so the next failure cycle must
                 # accumulate _CONSECUTIVE_FAIL_ALERT new failures before
-                # another email is sent (AUT-2310).
+                # another email is sent (AUT-2310). The counter is NOT reset
+                # here — alerted_at is the alert-once gate; clearing the
+                # counter would re-arm a new alert every 3 failures during a
+                # sustained outage (re-introduces the AUT-2310 spam).
                 eng.state.update(last_run=now.isoformat(), alerted_at=now.isoformat())
                 eng.alert_failure(e)
-                # Reset counter after alerting so the next failure cycle
-                # must accumulate _CONSECUTIVE_FAIL_ALERT new failures
-                # before another email is sent (fixes persistent email spam
-                # when host stays down: AUT-2370).
-                eng.state.update(consecutive_failures=0)
         except Exception as e:  # defensive: never kill the scheduler
             msg = f"unexpected: {e}"
             new_fails = fails + 1
@@ -224,7 +222,6 @@ class App:
             if new_fails >= _CONSECUTIVE_FAIL_ALERT and not st.get("alerted_at"):
                 eng.state.update(last_run=now.isoformat(), alerted_at=now.isoformat())
                 eng.alert_failure(e)
-                eng.state.update(consecutive_failures=0)
 
     def run_backup_now(self, iid):
         eng = self._engine(iid)

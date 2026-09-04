@@ -27,13 +27,18 @@ from pathlib import Path
 from engine import BackupEngine, BackupError, Config, Mailer, State
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
-VERSION = "3.0.3"
+VERSION = "3.0.4"
 
 SESSION_TTL = 24 * 3600
 
 # Consecutive failed attempts before the scheduler stops retrying and alerts;
 # a single transient failure self-heals on the next 60s tick (AUT-1023).
 _CONSECUTIVE_FAIL_ALERT = 3
+
+# Minimum seconds between attempts while consecutive_failures > 0 (AUT-2285).
+# Without this, the scheduler would idle for the full schedule_interval after
+# any single transient failure.
+_RETRY_SECONDS = 60
 
 
 class App:
@@ -150,20 +155,35 @@ class App:
         eng = self._engine(inst["id"])
         interval = max(60, int(inst.get("schedule_interval", 3600)))
         st = eng.state.get()
-        last = None
-        if st.get("last_run"):
+        # AUT-2285: due-ness is the OR of two clocks.
+        #   - Normal cadence: last_run + interval (don't hammer a healthy host).
+        #   - Failure cadence: last_attempt_at + _RETRY_SECONDS (recover quickly
+        #     from a transient blip instead of stalling for the full interval).
+        # Previously only the first clock existed, so a single failure on a
+        # long schedule (e.g. 1h on hosted) silenced retries for the rest of
+        # the interval — masked by tests that drove _scheduler_step()
+        # back-to-back.
+        def _parse(v):
             try:
-                last = datetime.fromisoformat(st["last_run"])
+                return datetime.fromisoformat(v) if v else None
             except ValueError:
-                last = None
+                return None
+        last_run = _parse(st.get("last_run"))
+        last_attempt = _parse(st.get("last_attempt_at"))
         now = datetime.now(timezone.utc)
-        due = last is None or (now - last).total_seconds() >= interval
-        delta = timedelta(seconds=interval)
-        next_run = (last if last is not None else now) + delta
+        due = (
+            (last_run is None and last_attempt is None)
+            or (last_run is not None and (now - last_run).total_seconds() >= interval)
+            or (last_attempt is not None
+                and (now - last_attempt).total_seconds() >= _RETRY_SECONDS)
+        )
+        anchor = last_run or last_attempt
+        next_run = (anchor if anchor is not None else now) + timedelta(seconds=interval)
         eng.state.update(next_run_at=next_run.isoformat())
         if not due or not inst.get("instance_url"):
             return
         fails = int(st.get("consecutive_failures") or 0)
+        eng.state.update(last_attempt_at=now.isoformat())
         try:
             eng.run_backup()
             # Success: reset consecutive counter so a later transient blip
@@ -172,30 +192,36 @@ class App:
         except BackupError as e:
             # Transient blips (deploy churn, DB restart, timeout) must not
             # consume last_run: leaving it stale lets the next 60s tick retry
-            # instead of waiting a full interval. Alert only after repeated
-            # failures so a one-off blip doesn't spam admins.
+            # instead of waiting a full interval. Alert exactly once when the
+            # failure streak first crosses the threshold — firing on every
+            # subsequent attempt (fails+1 >= N) would re-email admins every
+            # _RETRY_SECONDS tick and re-spam Discord forever (AUT-2310).
+            new_fails = fails + 1
             eng.state.update(last_status="fail", last_error=str(e),
-                             consecutive_failures=fails + 1)
+                             consecutive_failures=new_fails,
+                             last_attempt_at=now.isoformat())
             eng.state.touch_counters(ok=False)
-            if fails + 1 >= _CONSECUTIVE_FAIL_ALERT:
+            if new_fails >= _CONSECUTIVE_FAIL_ALERT and not st.get("alerted_at"):
                 # Back off: stamp last_run so next tick waits the full interval
-                # instead of hammering a genuinely-down host every 60s.
-                eng.state.update(last_run=_utcnow_iso())
+                # instead of hammering a genuinely-down host every 60s
+                # (AUT-2370). Stamp alerted_at so the next failure cycle must
+                # accumulate _CONSECUTIVE_FAIL_ALERT new failures before
+                # another email is sent (AUT-2310). The counter is NOT reset
+                # here — alerted_at is the alert-once gate; clearing the
+                # counter would re-arm a new alert every 3 failures during a
+                # sustained outage (re-introduces the AUT-2310 spam).
+                eng.state.update(last_run=now.isoformat(), alerted_at=now.isoformat())
                 eng.alert_failure(e)
-                # Reset counter after alerting so the next failure cycle
-                # must accumulate _CONSECUTIVE_FAIL_ALERT new failures
-                # before another email is sent (fixes persistent email spam
-                # when host stays down: AUT-2370).
-                eng.state.update(consecutive_failures=0)
         except Exception as e:  # defensive: never kill the scheduler
             msg = f"unexpected: {e}"
+            new_fails = fails + 1
             eng.state.update(last_status="fail", last_error=msg,
-                             consecutive_failures=fails + 1)
+                             consecutive_failures=new_fails,
+                             last_attempt_at=now.isoformat())
             eng.state.touch_counters(ok=False)
-            if fails + 1 >= _CONSECUTIVE_FAIL_ALERT:
-                eng.state.update(last_run=_utcnow_iso())
+            if new_fails >= _CONSECUTIVE_FAIL_ALERT and not st.get("alerted_at"):
+                eng.state.update(last_run=now.isoformat(), alerted_at=now.isoformat())
                 eng.alert_failure(e)
-                eng.state.update(consecutive_failures=0)
 
     def run_backup_now(self, iid):
         eng = self._engine(iid)

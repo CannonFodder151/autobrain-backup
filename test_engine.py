@@ -579,12 +579,12 @@ def test_scheduler_transient_retry(tmp):
 
 
 def test_scheduler_alerts_after_consecutive_failures(tmp):
-    """Persistent failures alert only after the threshold, then back off + reset.
+    """Persistent failures alert only after the threshold, then alert-once.
 
-    AUT-2370 regression: after the threshold alert fires, the consecutive
-    counter must reset to 0. Previously the counter stayed at 3+ forever,
-    so every subsequent tick that hit the threshold again immediately
-    re-sent the alert (host stays down → inbox flooded every interval).
+    AUT-2310 supersedes AUT-2370 here: after the threshold alert fires, the
+    `alerted_at` marker gates re-firing rather than resetting the counter.
+    The counter stays at the threshold value; the alert does NOT re-fire on
+    subsequent failing ticks. `alerted_at` is cleared on the next success.
     """
     smtp = start_smtp()
     srv = start_flaky(fail_first=999)
@@ -609,19 +609,20 @@ def test_scheduler_alerts_after_consecutive_failures(tmp):
         assert not FakeSMTP.inbox, "alert sent too early"
         app._scheduler_step(inst)                     # 3rd consecutive failure
         st = eng.state.get()
-        assert st["consecutive_failures"] == 0, st  # AUT-2370: reset after alert
+        # AUT-2310: counter is NOT reset; alerted_at gates re-firing.
+        assert st["consecutive_failures"] == 3, st
+        assert st.get("alerted_at"), st  # marker must be set
         assert st["last_run"] != "2020-01-01T00:00:00+00:00", st  # backs off a full interval
         assert len(FakeSMTP.inbox) == 1, "alert email not sent"
         assert b"job failed" in FakeSMTP.inbox[0].lower(), FakeSMTP.inbox[0]
 
-        # Force the scheduler back into "due" state and fail again — counter
-        # must start from 0 so the next alert requires 3 *new* failures,
-        # not the stale value from the prior cycle.
+        # Force the scheduler back into "due" state and fail again — alert
+        # must NOT re-fire because alerted_at is set (AUT-2310).
         eng.state.update(last_run="2020-01-01T00:00:00+00:00")
         app._scheduler_step(inst)
         app._scheduler_step(inst)
-        assert eng.state.get()["consecutive_failures"] == 2
-        assert len(FakeSMTP.inbox) == 1, "alert re-fired prematurely (AUT-2370)"
+        assert eng.state.get()["consecutive_failures"] == 5
+        assert len(FakeSMTP.inbox) == 1, "alert re-fired prematurely (AUT-2310)"
     finally:
         app.stop()
         srv.shutdown()

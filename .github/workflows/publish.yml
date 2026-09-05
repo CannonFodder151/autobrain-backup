@@ -4,13 +4,14 @@ on:
   push:
     branches: [main]
     tags: ["v*"]
+  workflow_dispatch:
 
 env:
   GHCR_IMAGE: ghcr.io/${{ github.repository_owner }}/autobrain-backup
   DH_IMAGE: cannonfodder151/autobrain-backup
 
 jobs:
-  build-and-push:
+  build-amd64:
     if: github.event_name != 'pull_request'
     runs-on: [self-hosted, linux, x64]
     permissions:
@@ -35,36 +36,188 @@ jobs:
         run: |
           GHCR="${GHCR_IMAGE,,}"
           if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
-            VER="${GITHUB_REF#refs/tags/}"
-            echo "ghcr_tags=${GHCR}:${VER},${GHCR}:latest" >> "$GITHUB_OUTPUT"
-            echo "dh_tags=$DH_IMAGE:${VER},$DH_IMAGE:latest" >> "$GITHUB_OUTPUT"
+            VER="${GITHUB_REF#refs/tags/v}"
+            echo "ghcr_tags=${GHCR}:${VER}-amd64" >> "$GITHUB_OUTPUT"
+            echo "dh_tags=" >> "$GITHUB_OUTPUT"
           else
-            SHA="${GITHUB_SHA::12}"
-            echo "ghcr_tags=${GHCR}:latest,$GHCR:$SHA" >> "$GITHUB_OUTPUT"
+            echo "ghcr_tags=${GHCR}:main-amd64" >> "$GITHUB_OUTPUT"
             echo "dh_tags=" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Build and push to GHCR
+      - name: Build and push amd64
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
           tags: ${{ steps.meta.outputs.ghcr_tags }}
+          platforms: linux/amd64
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+  build-arm64:
+    # arm64 hosted build — runs on the Oracle VM self-hosted runner
+    # (gh-runner-autobrain-arm64) so we don't need qemu (AUT-2097).
+    if: github.event_name != 'pull_request'
+    runs-on: [self-hosted, linux, ARM64]
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify runner arch
+        run: |
+          got="$(uname -m)"
+          if [ "$got" != "aarch64" ]; then
+            echo "::error::runner arch mismatch: want aarch64, got $got"
+            exit 1
+          fi
+          echo "==> runner arch OK: $got"
+
+      - name: Compute image tags
+        id: meta
+        shell: bash
+        run: |
+          GHCR="${GHCR_IMAGE,,}"
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            VER="${GITHUB_REF#refs/tags/v}"
+            echo "ghcr_tags=${GHCR}:${VER}-arm64" >> "$GITHUB_OUTPUT"
+            echo "dh_tags=" >> "$GITHUB_OUTPUT"
+          else
+            echo "ghcr_tags=${GHCR}:main-arm64" >> "$GITHUB_OUTPUT"
+            echo "dh_tags=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and push arm64
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.ghcr_tags }}
+          platforms: linux/arm64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Verify pushed image arch
+        env:
+          IMG: ${{ steps.meta.outputs.ghcr_tags }}
+        run: |
+          got="$(docker run --rm --platform linux/arm64 "$IMG" uname -m)"
+          if [ "$got" != "aarch64" ]; then
+            echo "::error::$IMG reports arch=$got, expected aarch64"
+            exit 1
+          fi
+          echo "==> arm64 image verified"
+
+  build-manifest:
+    needs: [build-amd64, build-arm64]
+    if: github.event_name != 'pull_request'
+    runs-on: [self-hosted, linux, x64]
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Gate manifest assembly on per-arch verification
+        env:
+          GHCR: ghcr.io/${{ github.repository_owner }}/autobrain-backup
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+              VER="${GITHUB_REF#refs/tags/v}"
+              img="${GHCR}:${VER}-${arch}"
+              [ -z "$VER" ] && img="${GHCR}:main-${arch}"
+            else
+              img="${GHCR}:main-${arch}"
+            fi
+            if ! docker buildx imagetools inspect "$img" >/dev/null 2>&1; then
+              echo "::error::$img missing — per-arch build for $arch did not publish. Aborting manifest assembly."
+              exit 1
+            fi
+          done
+
+      - name: Assemble multi-arch manifest + push to DH
+        env:
+          GHCR: ghcr.io/${{ github.repository_owner }}/autobrain-backup
+          DH: cannonfodder151/autobrain-backup
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            VER="${GITHUB_REF#refs/tags/v}"
+            primary="${VER}"
+            ghcr_tag="${GHCR}:${primary}"
+            dh_tag="${DH}:${primary}"
+            ghcr_latest="${GHCR}:latest"
+            dh_latest="${DH}:latest"
+          else
+            primary="main"
+            ghcr_tag="${GHCR}:${primary}"
+            dh_tag=""
+            ghcr_latest=""
+            dh_latest=""
+          fi
+
+          echo "==> manifest $ghcr_tag"
+          docker buildx imagetools create \
+            -t "$ghcr_tag" \
+            "${GHCR}:${primary}-amd64" \
+            "${GHCR}:${primary}-arm64"
+
+          if [ -n "$ghcr_latest" ]; then
+            echo "==> manifest $ghcr_latest"
+            docker buildx imagetools create \
+              -t "$ghcr_latest" \
+              "${GHCR}:${primary}-amd64" \
+              "${GHCR}:${primary}-arm64"
+          fi
+
+  publish-dockerhub:
+    needs: [build-amd64, build-arm64]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: [self-hosted, linux, x64]
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Login to Docker Hub
-        if: steps.meta.outputs.dh_tags != ''
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Push to Docker Hub
-        if: steps.meta.outputs.dh_tags != ''
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          tags: ${{ steps.meta.outputs.dh_tags }}
-          cache-from: type=gha
+      - name: Re-tag + push to Docker Hub
+        env:
+          GHCR: ghcr.io/${{ github.repository_owner }}/autobrain-backup
+          DH: cannonfodder151/autobrain-backup
+        run: |
+          set -euo pipefail
+          VER="${GITHUB_REF#refs/tags/v}"
+          for tag in "${VER}" "latest"; do
+            echo "==> pulling GHCR ${tag} multi-arch"
+            docker buildx imagetools create \
+              -t "${DH}:${tag}" \
+              "${GHCR}:${tag}-amd64" \
+              "${GHCR}:${tag}-arm64"
+          done

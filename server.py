@@ -382,6 +382,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._download_assets()
         if path == "/api/version":
             return self._send(200, {"version": VERSION, "app": "autobrain-backup"})
+        if path == "/healthz":
+            return self._send(200, {"status": "ok"})
         self._send(404, {"error": "not found"})
 
     def do_POST(self):

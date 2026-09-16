@@ -42,7 +42,7 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
 
       - name: Build and push multi-arch image
         env:
@@ -57,18 +57,19 @@ jobs:
           echo "==> pushed ghcr.io/cannonfodder151/autobrain-backup:${TAG}"
 
       - name: Verify manifest platforms
+        # Uses docker buildx imagetools (authenticated via the login step)
+        # instead of a raw curl to ghcr.io which requires a token exchange
+        # that GITHUB_TOKEN alone cannot perform.
         env:
           TAG: ${{ github.event.inputs.tag || 'hosted' }}
         run: |
           set -euo pipefail
-          curl -fsSL \
-            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Accept: application/vnd.oci.image.index.v1+json" \
-            "https://ghcr.io/v2/cannonfodder151/autobrain-backup/manifests/${TAG}" \
-            -o /tmp/index.json
-          python3 - <<'PY'
-          import json
-          d = json.load(open("/tmp/index.json"))
+          img="ghcr.io/cannonfodder151/autobrain-backup:${TAG}"
+          echo "==> verifying $img"
+          docker buildx imagetools inspect "$img" --raw | \
+            python3 - <<'PY'
+          import sys, json
+          d = json.load(sys.stdin)
           archs = sorted((m["platform"]["architecture"], m["platform"]["os"]) for m in d["manifests"])
           assert ("amd64","linux") in archs, ("amd64 missing", archs)
           assert ("arm64","linux") in archs, ("arm64 missing", archs)

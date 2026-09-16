@@ -57,19 +57,22 @@ jobs:
           echo "==> pushed ghcr.io/cannonfodder151/autobrain-backup:${TAG}"
 
       - name: Verify manifest platforms
-        # Uses docker buildx imagetools (authenticated via the login step)
-        # instead of a raw curl to ghcr.io which requires a token exchange
-        # that GITHUB_TOKEN alone cannot perform.
+        # Uses docker buildx imagetools inspect to a temp file instead of a raw curl
+        # to ghcr.io which requires a token exchange that GITHUB_TOKEN alone cannot perform.
+        # The build+push step succeeds (auth via docker/login-action handles the exchange),
+        # but the verification curl gets 'invalid token' and fails even though the image
+        # was successfully pushed as multi-arch.
         env:
           TAG: ${{ github.event.inputs.tag || 'hosted' }}
         run: |
           set -euo pipefail
           img="ghcr.io/cannonfodder151/autobrain-backup:${TAG}"
           echo "==> verifying $img"
-          docker buildx imagetools inspect "$img" --raw | \
-            python3 - <<'PY'
-          import sys, json
-          d = json.load(sys.stdin)
+          docker buildx imagetools inspect "$img" --raw \
+            > /tmp/manifest.json
+          python3 - <<'PY'
+          import json
+          d = json.load(open("/tmp/manifest.json"))
           archs = sorted((m["platform"]["architecture"], m["platform"]["os"]) for m in d["manifests"])
           assert ("amd64","linux") in archs, ("amd64 missing", archs)
           assert ("arm64","linux") in archs, ("arm64 missing", archs)

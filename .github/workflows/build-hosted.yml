@@ -6,10 +6,9 @@ name: build-hosted
 # (:latest / :vX.Y.Z on the x64 self-hosted runner) which produces amd64-only
 # — that breaks exec on arm64 (AUT-967 family).
 #
-# Uses the GitHub-hosted ubuntu-latest runner with buildx + qemu-user-static
-# (default on GitHub Actions runners since 2024). No self-hosted runner
-# required — the autobrain-backup repo currently only has an offline
-# x64 runner registered.
+# AUT-5654: runs on the repo's self-hosted x64 runner (gh-runner-autobrain-backup,
+# online, docker + buildx + qemu via docker/setup-qemu-action). GitHub-hosted
+# runners are in outage, so the multi-arch build moved to self-hosted.
 
 on:
   workflow_dispatch:
@@ -28,7 +27,7 @@ concurrency:
 jobs:
   build:
     if: github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64]
     permissions:
       contents: read
       packages: write
